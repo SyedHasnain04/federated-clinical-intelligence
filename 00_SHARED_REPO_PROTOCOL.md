@@ -1,0 +1,55 @@
+# SHARED REPO PROTOCOL — Read First (All 3 Members)
+
+## Two-stage project timeline
+- **Phases 1-6** (this document + your `Person[A/B/C]_Implementation_Plan.md`): build the working system. Do this first, in full, before anything below.
+- **Phase 7+** (`RESEARCH_PROTOCOL.md` + `EVAL_MODULE_SPEC.md`): converts the working system into a defensible research artifact — statistical rigor, ablations, failure analysis, reproducibility, final quality gate. Do not start Phase 7 queries until your Phase 6 PR is merged and a fresh-clone dry run passes. `RESEARCH_PROTOCOL.md` contains a **Master Contract** and a set of **Hard Rules (Section 39)** that apply to every person for every Phase 7+ task — read those before running any Phase 7 prompt.
+
+Repo: single shared GitHub repo, `main` is protected (no direct pushes). Everyone works on `feature/<person>-phase<N>-<slug>` branches.
+
+## Fixed repo structure (do not deviate — prevents merge collisions)
+```
+repo/
+  server/            # Person A
+  client/            # Person A
+  privacy/           # Person A
+  models/            # Person B
+  data/              # Person B (preprocessing.py) + Person A (partition.py)
+  monitoring/        # Person C
+  dashboard/         # Person C
+  infra/             # Person C (Docker, CI)
+  config/            # shared — base.yaml, edited only after a PR comment ping to the other two
+  tests/             # each person adds tests/test_<their_module>.py — never edit another person's test file
+  README.md          # Person C owns top-level; each module folder has its own README.md owned by that person
+
+  # Phase 7+ additions (see RESEARCH_PROTOCOL.md — do not start these until Phases 1-6 are merged)
+  experiments/       # shared — configs + CLI, Kiran leads scaffolding, A+B add their own configs
+  eval/              # shared, co-owned — see EVAL_MODULE_SPEC.md. Mandatory cross-review, see exception below.
+  results/           # generated only — never hand-edited; raw output gitignored, only committed summary tables/plots
+  docs/research/     # RQs, protocol, failure analysis, limitations, skeptical review — Kiran leads, A+B contribute
+```
+Rule: you only ever edit files inside your own folder(s) + your own `tests/test_*.py` + your own module's README. If you need a change in `config/base.yaml` or another person's folder, open the PR, tag them, wait for their approval comment — do not edit and merge unilaterally.
+
+**Exception for `eval/` (Phase 7+ only):** this folder is co-owned by all three. Any PR touching `eval/` requires review from at least one other person before merge, even though it's not "their" folder — this is intentional, since every experiment across all three roles depends on this module reporting identical metrics.
+
+## The exact cycle for EVERY phase, no exceptions
+1. `git checkout main && git pull origin main` — sync before starting any new phase, always.
+2. `git checkout -b feature/<person>-phase<N>-<slug>`
+3. Implement using the "Build" instructions for that phase.
+4. Run the code agent's test command locally.
+5. **If tests fail:** feed the exact error/stack trace back to the code agent with: "This test failed: [paste error]. Fix the implementation (not the test) unless the test itself is provably wrong, then re-run." Repeat until green. Do not push red.
+6. `git add <your files only> && git commit -m "phase<N>: <what changed>"`
+7. `git push origin feature/<person>-phase<N>-<slug>`
+8. Open PR into `main`. In the PR description paste: (a) test output, (b) what changed, (c) any files touched outside your own folder (should be rare/zero).
+9. **Before requesting merge**, pull `main` again and check for drift: `git fetch origin main && git diff origin/main -- <shared files you touched, e.g. config/base.yaml>`. If `main` moved (another person merged a phase while you worked), do:
+   `git checkout feature/<person>-phase<N>-<slug> && git merge origin/main`
+   Resolve any conflicts by hand — if a conflict is in someone else's folder, take their version (`git checkout --theirs <path>`); if it's in `config/base.yaml`, resolve manually and re-run your tests after resolving.
+10. Re-run tests after any merge/rebase. Only request review once green post-merge.
+11. Human review (the checkpoint listed in your phase) → approve → squash-merge to `main` → delete branch.
+12. All three people run `git pull origin main` before starting their next phase — do not start Phase N+1 on stale `main`.
+
+## Error-rectification rule (applies at every step, every phase)
+Any time a test fails, a merge conflict appears, or the code agent's output doesn't match the phase's Deliverable spec exactly:
+- Do not proceed to the next task.
+- Do not push.
+- Feed the exact failure output back to the code agent and require a fix-and-retest loop until: all listed tests pass AND the deliverable matches spec AND `git status` is clean.
+- Only then continue.
