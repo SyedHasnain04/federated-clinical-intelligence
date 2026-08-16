@@ -1,7 +1,9 @@
 # Person B — Multimodal Modeling
 ## Implementation Plan (follow 00_SHARED_REPO_PROTOCOL.md for every phase)
 
-Folders owned: `models/`, `data/preprocessing.py`, `tests/test_models.py`, `tests/test_preprocessing.py`.
+Folders owned: `models/`, `data/preprocessing.py`, `data/partition.py`, `data/mock_schema.py`, `tests/test_models.py`, `tests/test_preprocessing.py`, `tests/test_partition.py`.
+
+**You are the only team member with PhysioNet-credentialed MIMIC-IV access.** Real patient data lives only on your machine, is never committed to git (`.gitignore` enforces this), and is never shared with Ishthiyaq or Kiran directly. They build and test against `data/mock_schema.py`, a synthetic dataset you generate matching MIMIC-IV's exact schema. Kick off PhysioNet CITI training + data use agreement in Week 0, in parallel with everything else — it's the longest lead-time item in the project.
 
 ---
 
@@ -11,6 +13,8 @@ Folders owned: `models/`, `data/preprocessing.py`, `tests/test_models.py`, `test
 - Read Person A's `models/model_interface.py` stub (pull `main` after their Phase 1 merges). Confirm your model will implement standard `nn.Module` with `.state_dict()`/`.load_state_dict()`.
 - `models/tabular.py`, `models/text.py`, `models/fusion.py` created as empty class stubs: `class TabularEncoder(nn.Module)`, `class TextEncoder(nn.Module)`, `class FusionModel(nn.Module)` — just `__init__` and `forward` signatures, no logic yet
 - Decision recorded as a comment at top of `models/text.py`: frozen ClinicalBERT vs lightweight BiLSTM/TF-IDF, with one sentence why
+- `data/mock_schema.py` with `generate_mock_data(n_patients: int = 2000) -> pd.DataFrame`: produces synthetic data matching MIMIC-IV's exact column names/dtypes (tabular vitals/labs + a synthetic free-text note column), so Ishthiyaq and Kiran can build against it immediately without PhysioNet access
+- `data/partition.py` with `partition_data(df, num_nodes, strategy="dirichlet", alpha=0.5, seed=42) -> dict[int, pd.DataFrame]`, writing to `data/nodes/node_{i}/data.parquet` — run this against `data/mock_schema.py` output for teammates, and separately against real MIMIC-IV locally once your PhysioNet access clears (real output never committed)
 
 **Test command:** `pytest tests/test_models.py::test_imports -v`
 **Test must confirm:** all three classes instantiate with dummy args and `forward()` on random tensors returns a tensor of the expected shape (declare expected shape as a docstring in each class).

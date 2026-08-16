@@ -20,13 +20,13 @@ Before every phase: `git checkout main && git pull origin main`, then branch per
 ## Phase 2
 
 **Prompt 1 (build):**
-> Write `data/partition.py` with `def partition_data(df, num_nodes, strategy="dirichlet", alpha=0.5, seed=42) -> dict[int, pd.DataFrame]`. Support Dirichlet-based non-IID sharding on the label column. Save each node's data to `data/nodes/node_{i}/data.parquet` and write `data/nodes/partition_report.json` with per-node n_samples, positive_rate, mean_age, top_features_summary.
+> A teammate (Person B) owns MIMIC-IV data access and partitioning — they'll provide `data/nodes/node_{i}/data.parquet` files, either real (on their machine only) or synthetic via `data/mock_schema.py` (shared with us). Write a loader in `server/data_loader.py` that reads these partitions given a `data_dir` path, with no assumptions baked in about whether the data is real or mock — same schema either way. Confirm it works against Person B's `data/mock_schema.py` output.
 
 **Prompt 2 (test + fix loop):**
-> Write `tests/test_partition.py` asserting: (1) zero patient_id overlap across nodes, (2) total samples across nodes equals original dataframe length, (3) same seed produces identical output on repeated calls (hash-compare the parquet files), (4) print a warning (not a hard fail) if any node's positive_rate < 0.02. Run `pytest tests/test_partition.py -v`. If assertion 1, 2, or 3 fails, this is a correctness bug — show me the traceback, fix, and re-run until all pass. Report the final `partition_report.json` contents to me directly in your response.
+> Write `tests/test_server.py::test_loads_partitioned_data` that generates mock partitions using Person B's `data/mock_schema.py`, loads them via the new loader, and asserts the resulting dataframe has the expected columns/dtypes. Run it, fix any failures, re-run until green.
 
 **Prompt 3 (push):**
-> Commit as "phase2: non-IID partitioning", push to `feature/personA-phase2-partition`, open PR with the partition_report.json contents and test output in the description.
+> Commit as "phase2: mock/real partition loader", push to `feature/personA-phase2-dataloader`, open PR, and note in the description that this was tested against mock data only — confirm with Person B that real MIMIC-IV partitions share the identical schema before this is trusted end-to-end.
 
 ---
 

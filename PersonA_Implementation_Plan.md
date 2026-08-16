@@ -1,7 +1,7 @@
 # Person A — Federated Infrastructure & Privacy
 ## Implementation Plan (follow 00_SHARED_REPO_PROTOCOL.md for every phase)
 
-Folders owned: `server/`, `client/`, `privacy/`, `data/partition.py`, `tests/test_server.py`, `tests/test_client.py`, `tests/test_privacy.py`, `tests/test_partition.py`.
+Folders owned: `server/`, `client/`, `privacy/`, `tests/test_server.py`, `tests/test_client.py`, `tests/test_privacy.py`. **You do not own `data/partition.py`** — that belongs to Person B, who holds the real MIMIC-IV access. You build and test everything against `data/mock_schema.py` (synthetic data, same schema), which Person B delivers in their Phase 1.
 
 ---
 
@@ -25,23 +25,16 @@ Folders owned: `server/`, `client/`, `privacy/`, `data/partition.py`, `tests/tes
 
 ---
 
-### PHASE 2 — Non-IID Data Partitioning
+### PHASE 2 — Consume Mock/Real Partitioned Data
 
 **Deliverable (exact):**
-- `data/partition.py` with function `partition_data(df: pd.DataFrame, num_nodes: int, strategy: str = "dirichlet", alpha: float = 0.5, seed: int = 42) -> dict[int, pd.DataFrame]`
-- Writes output to `data/nodes/node_{i}/data.parquet` for i in range(num_nodes)
-- Also writes `data/nodes/partition_report.json` containing per-node: `n_samples`, `positive_rate`, `mean_age`, `top_features_summary`
+- No longer your task to write the partitioner. Pull Person B's `data/partition.py` output (real MIMIC-IV, on their machine only) or `data/mock_schema.py` synthetic output (yours to run locally) from `data/nodes/node_{i}/data.parquet`.
+- Confirm `server/run_simulation.py` (Phase 3) can load whichever of these is present without code changes — same schema, same column names, so your pipeline is agnostic to real-vs-mock.
 
-**Test command:** `pytest tests/test_partition.py -v`
-**Tests must confirm (exact assertions):**
-1. `assert set of all patient_ids across nodes has no duplicates`
-2. `assert sum(n_samples across nodes) == len(original_df)`
-3. `assert partition_data(df, 4, seed=42)` called twice produces identical output (hash-compare)
-4. `assert every node has positive_rate > 0.02` (flag, don't hard-fail, if any node is near-zero — print warning)
+**Test command:** `pytest tests/test_server.py::test_loads_partitioned_data -v`
+**Test must confirm:** loading `data/nodes/node_{i}/data.parquet` (using mock data generated via Person B's `data/mock_schema.py`) produces a dataframe with the expected columns/dtypes.
 
-**Fix loop:** if patient overlap assertion fails, this is a correctness bug — do not proceed to Phase 3 until fixed and re-verified.
-
-**Human checkpoint:** open `data/nodes/partition_report.json` and personally read every node's `positive_rate`. If any node is under 2%, decide manually whether to re-seed/re-strategy or keep it as an intentional stress case, and write that decision as a one-line comment at the top of `partition.py`.
+**Human checkpoint:** confirm with Person B that the mock schema's column names/types exactly match what real MIMIC-IV partitions will have — a mismatch here silently breaks the moment real data is swapped in later.
 
 ---
 

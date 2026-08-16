@@ -1,7 +1,7 @@
 # Person C — Self-Evolving Loop, MLOps & Product
 ## Implementation Plan (follow 00_SHARED_REPO_PROTOCOL.md for every phase)
 
-Folders owned: `monitoring/`, `dashboard/`, `infra/`, top-level `README.md`, `.github/workflows/ci.yml`, `tests/test_monitoring.py`, `tests/test_dashboard.py`.
+Folders owned: `monitoring/`, `dashboard/`, `infra/`, top-level `README.md`, `.github/workflows/ci.yml`, `tests/test_monitoring.py`, `tests/test_dashboard.py`. **You never touch real MIMIC-IV data** — Person B (Syed) is the sole holder of PhysioNet access. Build and test everything against `data/mock_schema.py` synthetic output.
 
 ---
 
