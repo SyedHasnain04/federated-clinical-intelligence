@@ -5,11 +5,14 @@ Rule for every section marked [EVIDENCE-GATED]: do not write actual numbers/clai
 ---
 
 ## Title
-Working title: "Privacy-Preserving Multimodal Federated Learning for Clinical Severity Prediction with Automated Drift Recovery" — revise once results are in; the title should reflect your actual strongest finding, not just the system description.
+Working title (locked): "Does Privacy Cost You Detection? Characterizing the Interaction Between Differential Privacy and Drift Detection in Federated Clinical Learning"
 
 ## Abstract (150-250 words) — [EVIDENCE-GATED, write last]
-Template:
-> Centralizing multi-hospital clinical data for AI training is often infeasible due to privacy regulation. We present a federated learning system that trains a multimodal (tabular EHR + clinical note) severity/mortality prediction model across simulated hospital nodes using [N] MIMIC-IV patients, without centralizing raw data. We evaluate the privacy-utility tradeoff under differential privacy (ε=[values]), the effect of non-IID data distribution, and — as our primary contribution — the system's ability to detect and recover from data drift through automated retraining. Across [N] seeds, our federated model reaches [X]% of centralized baseline accuracy, [Y]% of drift events are recovered to within [Z]% of pre-drift performance within [W] retraining rounds, and we find [key honest finding, positive or negative]. We release [code/reproducibility statement].
+Locked template — do not deviate from this framing once Phase 7.D/7.E results exist:
+
+> Federated learning enables multi-hospital collaboration on clinical prediction models without centralizing patient data, and differential privacy (DP) further protects individual records during training. Separately, automated drift detection allows federated systems to recognize and recover from shifting patient populations without manual intervention. However, the interaction between these two mechanisms is untested: DP noise, injected to protect privacy, may itself resemble the statistical signature of drift, potentially degrading a system's ability to reliably detect real distributional shifts. We study this interaction in a federated, multimodal (tabular EHR + clinical note) severity/mortality prediction system trained on MIMIC-IV COVID-19 data across [N] simulated hospital nodes. Across [N] seeds and [N] epsilon levels (ε=[values]), we measure drift-detector false-positive rate, false-negative rate, and detection delay under [N] injected drift severities. We find that [PRIMARY FINDING — fill in only once V.F data exists]. We further quantify the resulting cost in wasted federated communication rounds and examine calibration stability under this interaction. Our results suggest that [PRACTICAL IMPLICATION — fill in only once results support a specific recommendation]. We release [code/reproducibility statement].
+
+Do not write the two bracketed sentences until real `results/registry.jsonl` data from the DP×drift grid exists — see `RESULTS_STORAGE_SPEC.md`.
 
 ## I. Introduction
 Not evidence-gated — can draft now. Cover: (1) the privacy/generalization/single-modality problem (from `PRODUCT_SPEC.md`), (2) gap in existing work — see Related Work sourcing, (3) your contribution statement (draft this once you know your strongest result — see note below), (4) paper roadmap.
@@ -43,29 +46,27 @@ Must state, pulled directly from `docs/research/experimental_protocol.md` and ac
 ## V. Results — [FULLY EVIDENCE-GATED, do not draft prose until data exists]
 Structure (fill each subsection only once its experiments are logged):
 
-**V.A Centralized vs Federated Baseline**
-`[INSERT: Table — centralized vs federated accuracy/F1/AUROC/AUPRC, mean±std across N seeds, from eval/statistical_comparison.py comparing training_mode=centralized vs training_mode=federated]`
+**V.F Differential Privacy × Drift Detection Interaction (PRIMARY CONTRIBUTION — give this the most space, lead with it in the section ordering, consider presenting before V.A-V.E in the final draft)**
+`[INSERT: Table — false positive rate, false negative rate, detection delay, as a function of epsilon (rows) and drift severity (columns), mean±std across 5 seeds, from Ishthiyaq+Kiran's crossed Phase 7.D grid]`
+`[INSERT: Figure — FP rate vs epsilon, one line per drift severity, from eval/plots.py]`
+`[INSERT: statistical test — does FP rate change significantly with epsilon? eval/statistical_comparison.py, effect size + p-value]`
+`[INSERT: honest statement of the finding, whichever direction the data supports — do not force a "DP hurts detection" narrative if the data shows no effect; a null result here is still worth reporting given the novelty of testing the interaction at all]`
 
-**V.B Effect of Non-IID Partitioning**
-`[INSERT: Table/Figure — IID vs label-skew vs quantity-skew, from eval/plots.py plot_iid_vs_noniid, pulling results with matching partition_config]`
+**V.F.1 Supporting Evidence — Cost of False Positives**
+`[INSERT: Table — wasted communication rounds/bytes attributable to false-positive detections at each epsilon level, from eval/communication_cost.py]`
 
-**V.C Multimodal Ablation**
-`[INSERT: Table — tabular-only vs text-only vs fusion, mean±std, N seeds, statistical significance + effect size from eval/statistical_comparison.py]`
-`[INSERT: honest statement if fusion does NOT outperform tabular-only — report this plainly if true]`
+**V.F.2 Supporting Evidence — Calibration Under the Interaction**
+`[INSERT: Table/brief statement — ECE, Brier score for recovered models at each (epsilon × drift severity) cell, from eval/calibration.py. Keep this brief (a few sentences) unless the effect is meaningfully large, in which case expand.]`
 
-**V.D Privacy-Utility Tradeoff**
-`[INSERT: Table/Figure — eval/privacy_utility_table.py output, epsilon values vs accuracy/F1/convergence]`
+**V.G Recovery Performance (secondary, still real evidence but not the paper's spine)**
+`[INSERT: Table — recovery %, remaining gap, retraining cost, per (epsilon, seed), from Person C's Phase 7.E]`
 
-**V.E Client Dropout Robustness**
-`[INSERT: Table — 0/10/25/50% dropout vs performance/convergence speed, from Person A's Phase 7.C results]`
+**V.H Supporting Baselines (brief, establish the system works before presenting the main finding)**
+`[INSERT: Table — centralized vs federated accuracy/F1/AUROC/AUPRC, mean±std across N seeds]`
+`[INSERT: Table — tabular-only vs text-only vs fusion, brief — establishes the multimodal system is reasonable, not itself the contribution]`
+`[INSERT: brief note on non-IID partitioning and dropout robustness if space allows — otherwise summarize in one paragraph, full tables in an appendix/supplementary]`
 
-**V.F Drift Detection and Recovery (primary contribution — give this the most space)**
-`[INSERT: Table — false positive rate, false negative rate, detection delay across drift severities, from Person C's Phase 7.D]`
-`[INSERT: Figure — pre-drift / post-drift / recovery timeline, from eval/plots.py plot_recovery_timeline, across N seeds]`
-`[INSERT: Table — recovery %, remaining gap, retraining cost, per seed, from Person C's Phase 7.E]`
-
-**V.G Communication Cost**
-`[INSERT: Table/Figure — total bytes transmitted, baseline FL vs FL+DP vs adaptive retraining, from eval/communication_cost.py]`
+Sections not included in this paper's Results (demoted to Limitations/Future Work per the scoping decision): non-IID heterogeneity as a confound with true drift, epsilon-adaptive drift thresholds, detector window-size sensitivity, real-vs-synthetic drift comparison.
 
 ## VI. Discussion — [EVIDENCE-GATED, write after Results is complete]
 - Interpret each result honestly, including negative/unexpected findings
@@ -86,5 +87,5 @@ Maintain as `docs/research/references.bib` alongside this draft, built increment
 ## Companion checklist — `docs/research/paper_checklist.md`
 Create this alongside the draft. Each row: section name | evidence source (exact file/results filter) | status (not started / experiments running / data logged / drafted / reviewed). No section moves to "drafted" until its evidence source column has a real, checkable path — not "TBD."
 
-## Contribution statement — decide this once you see real V.F results
-Do not lock the abstract/intro's contribution claim until the drift-recovery results (V.F) are in — that's flagged as your likely strongest, most novel finding, and the paper's framing should follow the data, not be decided in advance and then results forced to fit it.
+## Contribution statement — locked scope
+The paper's single contribution is: **characterizing how differential privacy noise affects drift-detection reliability in federated clinical learning** (false-positive rate, false-negative rate, detection delay, as a function of epsilon and drift severity), with two supporting evidence pieces (communication cost of false positives, calibration stability). Do not let the paper's framing drift back out to include non-IID-as-pseudo-drift, adaptive thresholds, or other explored-but-descoped angles as co-equal contributions — those belong in Limitations/Future Work only, per the explicit scoping decision. Do not lock the two bracketed sentences in the Abstract until the V.F results are in — the paper's framing should follow the data, not be decided in advance and then results forced to fit it.

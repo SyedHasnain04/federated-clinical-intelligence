@@ -84,8 +84,11 @@ Owns queries: **1 (repo audit — lead, joint), 5 (federated baseline verificati
 **Phase 7.C — Client Dropout Matrix**
 - Deliverable: `experiments/configs/dropout_{0,10,25,50}.yaml`, run each with fixed seeds, `experiments/run_dropout_matrix.py` producing `results/dropout_results.json` with final performance, convergence speed, rounds completed, variance across seeds. Explicit test for zero-available-clients case.
 
-**Phase 7.D — DP Privacy-Utility Study**
-- Deliverable: 4 configs (no DP, low/medium/high noise), each recording epsilon/delta/noise_multiplier/clip_norm/performance/convergence/time. `eval/privacy_utility_table.py` generates the table + plot. Test proving DP accounting is actually active on the real training path (not just imported).
+**Phase 7.D — DP Privacy-Utility Study + Drift-Detection Interaction (PRIMARY CONTRIBUTION — coordinate directly with Kiran, do not run in isolation)**
+- Deliverable: 4 DP configs (no DP, low/medium/high noise), each recording epsilon/delta/noise_multiplier/clip_norm/performance/convergence/time — same as before, BUT each config must also run Kiran's drift-injection + detection pipeline (Phase 7.D below) at each of 3-4 drift severities, across 5 seeds minimum. This produces a DP-level × drift-severity grid, not two separate sweeps — the crossing is the actual experiment.
+- Your specific responsibility: ensure DP training path exposes the per-round accuracy/loss signal Kiran's detector reads, at every noise level, and that `results/registry.jsonl` records include both `privacy_config` and `drift_config` populated together on every row in this study (never one or the other).
+- `eval/privacy_utility_table.py` generates the table + plot; extend it to also report drift-detector false-positive rate as a column at each epsilon level.
+- Test proving DP accounting is actually active on the real training path (not just imported).
 
 **Phase 7.E — Communication Cost + Convergence**
 - Deliverable: `eval/communication_cost.py` measuring update size × rounds × clients = total bytes transmitted, for baseline FL / FL+DP / adaptive retraining. Per-round loss/accuracy/participation logged for IID, non-IID, dropout, DP — convergence plots for each.
@@ -130,11 +133,18 @@ This is the heaviest Phase 7+ load since it includes the project-wide infra (CLI
 **Phase 7.C — Centralized Baseline Harness**
 - Deliverable: `experiments/run_centralized_baseline.py` using identical dataset/preprocessing/model/optimizer/budget/split/seeds as the federated experiments. Test proving both paths share the same preprocessing + model config (not just "looks similar").
 
-**Phase 7.D — Drift Injection + Detection Evaluation**
-- Deliverable: `monitoring/inject_drift.py` extended to support feature/distribution shift AND label-prevalence shift, deterministic, provenance-preserving, never touches eval data. `monitoring/drift_detector.py` evaluated for false-positive rate, false-negative rate, detection delay, sensitivity — tested against no-drift, small, medium, large drift (not only the drifted case).
+**Phase 7.D — Drift Injection + Detection Evaluation, Crossed with DP (PRIMARY CONTRIBUTION — coordinate directly with Ishthiyaq, do not run in isolation)**
+- Deliverable: `monitoring/inject_drift.py` extended to support feature/distribution shift AND label-prevalence shift, at 3-4 configurable severities, deterministic, provenance-preserving, never touches eval data. `monitoring/drift_detector.py` evaluated for false-positive rate, false-negative rate, detection delay, sensitivity — tested against no-drift, small, medium, large drift.
+- **This is not a standalone sweep.** Run the full drift-severity sweep at EACH of Ishthiyaq's 4 DP noise levels (no DP, low, medium, high), 5 seeds minimum per (DP level × drift severity) cell. That's the actual experiment matrix — roughly 4 DP levels × 4 drift severities × 5 seeds = 80 runs for this section. Budget real time for this; do not compress seed count to save time here, since this is the paper's central evidence.
+- Hypothesis being tested (state this explicitly in your experiment notes, don't just collect numbers blind): DP noise, injected via gradient clipping + Gaussian noise, resembles the statistical signature of mild drift closely enough to raise the detector's false-positive rate and/or mask real drift, degrading detection reliability as epsilon decreases.
+- Output: a table with columns [dp_epsilon, drift_severity, seed, false_positive_rate, false_negative_rate, detection_delay_rounds] — every cell of the grid populated, not averaged before storage (see `RESULTS_STORAGE_SPEC.md`).
 
-**Phase 7.E — Recovery Experiment (your core deliverable, do not compress)**
-- Deliverable: full loop — train baseline → establish performance → inject drift → measure degradation → detect → trigger → measure post-adaptation performance — repeated across 5 seeds minimum. Report degradation, recovery %, remaining gap, detection delay, retraining cost per seed. If recovery fails on any seed, report and investigate — do not adjust thresholds until it looks right.
+**Phase 7.E — Recovery Experiment + Supporting Evidence (your core deliverable, do not compress)**
+- Deliverable: full loop — train baseline → establish performance → inject drift → measure degradation → detect → trigger → measure post-adaptation performance — repeated across 5 seeds minimum, run at each DP level from 7.D (not just DP-off). Report degradation, recovery %, remaining gap, detection delay, retraining cost per (DP level × seed).
+- **Supporting evidence #1 — communication cost of false positives:** for every false-positive detection event in the 7.D grid, use `eval/communication_cost.py` to quantify the wasted federated round(s) it triggered (bytes transmitted, rounds spent). Report this as "cost of false alarms" per DP level — this turns "DP causes more false positives" into a concrete, practitioner-relevant number.
+- **Supporting evidence #2 — calibration under the interaction:** for the recovered model at each (DP level × drift severity) cell, run `eval/calibration.py` (ECE, Brier score, coordinate with Syed). Report briefly regardless of outcome; expand only if calibration is meaningfully affected — do not force this into a full section if the effect is null.
+- If recovery fails on any seed, report and investigate — do not adjust thresholds until it looks right.
+- Explicitly out of scope for this paper (mention only as a one-line Limitations/Future Work item, do not run as a full experiment): non-IID heterogeneity as a confound with true drift, epsilon-adaptive drift thresholds, detector window-size sensitivity, real-vs-synthetic drift comparison.
 
 **Phase 7.F — Visualization + Statistical Comparison**
 - Deliverable: `eval/plots.py` generating the 9 required plots (centralized vs federated, IID vs non-IID, DP tradeoff, dropout robustness, multimodal ablation, convergence curves, drift detection, pre/post/recovery, communication cost) — all with axis labels/units/legends/error bars, regenerable from scripts, never hand-edited. `eval/statistical_comparison.py` with appropriate paired-comparison tests + effect sizes for centralized-vs-federated, FL-vs-FL+DP, tabular-vs-multimodal, no-adaptation-vs-adaptation.
