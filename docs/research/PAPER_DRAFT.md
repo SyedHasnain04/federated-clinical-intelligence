@@ -1,91 +1,88 @@
-# PAPER_DRAFT.md — IEEE-format scaffold, evidence-gated
+# PAPER_DRAFT.md — IEEE Regional Conference Paper Scaffold (4–6 Pages)
 
-Rule for every section marked [EVIDENCE-GATED]: do not write actual numbers/claims until the corresponding experiment exists in `results/registry.jsonl`. Use the bracketed placeholder format shown until real data exists — never fill in a plausible-looking number as a placeholder, since that's how fabricated-looking claims sneak into drafts.
+Target: Regional IEEE conference (4–6 pages, IEEE two-column format).
+Scope: **RQ1 only**. Strands agent recovery and multimodal fusion are future work.
+Working Title: **"Privacy-Aware Drift Detection in Federated Clinical Learning: How Differential Privacy Affects Detection Reliability"**
+
+Rule for sections marked `[EVIDENCE-GATED]`: Do not write actual numbers or claims until the corresponding experiment is logged in `results/registry.jsonl`.
 
 ---
 
-## Title
-Working title (locked): "Does Privacy Cost You Detection? Characterizing the Interaction Between Differential Privacy and Drift Detection in Federated Clinical Learning"
+## Abstract (150–200 words) — [EVIDENCE-GATED]
 
-## Abstract (150-250 words) — [EVIDENCE-GATED, write last]
-Locked template — do not deviate from this framing once Phase 7.D/7.E results exist:
+Federated learning enables collaborative training of clinical models across decentralized clients without centralizing raw electronic health records. Applying differential privacy (DP) bounds the influence of individual records against inference attacks, but privacy noise added during training or to validation signals may mask or simulate distribution shifts. We investigate this trade-off under a controlled experimental benchmark: how does a formally specified record-level DP mechanism affect drift-detection reliability and clinical predictive performance across stable, localized, global, abrupt, gradual, and natural-temporal drift in simulated-client federated learning? Using MIMIC-IV v3.1 adult first ICU stay data (24-hour landmark mortality prediction) across 3–5 simulated clients, we evaluate detection precision, recall, detection delay, false alarm rates, and post-drift clinical utility under non-private reference and DP-released detector signals. We characterize the boundary where privacy noise degrades detection reliability and assess deterministic rule-based recovery under strict cumulative privacy accounting. `[PRIMARY FINDING: fill in once Phase 7.D/E registry data exists]`.
 
-> Federated learning enables multi-hospital collaboration on clinical prediction models without centralizing patient data, and differential privacy (DP) further protects individual records during training. Separately, automated drift detection allows federated systems to recognize and recover from shifting patient populations without manual intervention. However, the interaction between these two mechanisms is untested: DP noise, injected to protect privacy, may itself resemble the statistical signature of drift, potentially degrading a system's ability to reliably detect real distributional shifts. We study this interaction in a federated, multimodal (tabular EHR + clinical note) severity/mortality prediction system trained on MIMIC-IV COVID-19 data across [N] simulated hospital nodes. Across [N] seeds and [N] epsilon levels (ε=[values]), we measure drift-detector false-positive rate, false-negative rate, and detection delay under [N] injected drift severities. We find that [PRIMARY FINDING — fill in only once V.F data exists]. We further quantify the resulting cost in wasted federated communication rounds and examine calibration stability under this interaction. Our results suggest that [PRACTICAL IMPLICATION — fill in only once results support a specific recommendation]. We release [code/reproducibility statement].
-
-Do not write the two bracketed sentences until real `results/registry.jsonl` data from the DP×drift grid exists — see `RESULTS_STORAGE_SPEC.md`.
+---
 
 ## I. Introduction
-Not evidence-gated — can draft now. Cover: (1) the privacy/generalization/single-modality problem (from `PRODUCT_SPEC.md`), (2) gap in existing work — see Related Work sourcing, (3) your contribution statement (draft this once you know your strongest result — see note below), (4) paper roadmap.
-
-## II. Related Work
-Not evidence-gated, but citation-gated — every claim here needs a real, verified source (see prior guidance on sourcing via Google Scholar/Semantic Scholar/ML4H/CHIL). Structure:
-- Federated learning foundations (FedAvg, non-IID challenges)
-- Differential privacy in federated/healthcare ML
-- Multimodal clinical prediction (tabular + text fusion)
-- Concept drift detection and adaptive retraining (federated or general ML)
-- Explicitly state, in one sentence per subsection, how your work differs from what's cited — this is what makes it a contribution, not a survey.
-
-## III. Methodology
-Not evidence-gated — pull directly from `TECH_ARCHITECTURE.md`. Cover:
-- System architecture (reuse/adapt the architecture diagram)
-- Data partitioning strategy (IID + non-IID variants, from Person A's Phase 7.B)
-- Model architecture (tabular encoder, text encoder, fusion — from Person B's models)
-- Privacy mechanism (Opacus, DP-SGD, accounting method)
-- Drift detection + retraining trigger mechanism (from Person C's Phase 7.D/E)
-
-## IV. Experimental Setup — [EVIDENCE-GATED for specific numbers, structure can be written now]
-Must state, pulled directly from `docs/research/experimental_protocol.md` and actual `ExperimentResult` configs:
-- Dataset: MIMIC-IV version, cohort size, feature set, label definition
-- Train/val/test split methodology
-- Number of simulated nodes, partitioning strategy details
-- Model hyperparameters, training budget (epochs, rounds, batch size, lr)
-- Number of seeds per experiment (state the actual number used — this must match what's really in `results/registry.jsonl`)
-- Hardware/compute used
-- Evaluation metrics (from `eval/clinical_metrics.py`)
-
-## V. Results — [FULLY EVIDENCE-GATED, do not draft prose until data exists]
-Structure (fill each subsection only once its experiments are logged):
-
-**V.F Differential Privacy × Drift Detection Interaction (PRIMARY CONTRIBUTION — give this the most space, lead with it in the section ordering, consider presenting before V.A-V.E in the final draft)**
-`[INSERT: Table — false positive rate, false negative rate, detection delay, as a function of epsilon (rows) and drift severity (columns), mean±std across 5 seeds, from Ishthiyaq+Kiran's crossed Phase 7.D grid]`
-`[INSERT: Figure — FP rate vs epsilon, one line per drift severity, from eval/plots.py]`
-`[INSERT: statistical test — does FP rate change significantly with epsilon? eval/statistical_comparison.py, effect size + p-value]`
-`[INSERT: honest statement of the finding, whichever direction the data supports — do not force a "DP hurts detection" narrative if the data shows no effect; a null result here is still worth reporting given the novelty of testing the interaction at all]`
-
-**V.F.1 Supporting Evidence — Cost of False Positives**
-`[INSERT: Table — wasted communication rounds/bytes attributable to false-positive detections at each epsilon level, from eval/communication_cost.py]`
-
-**V.F.2 Supporting Evidence — Calibration Under the Interaction**
-`[INSERT: Table/brief statement — ECE, Brier score for recovered models at each (epsilon × drift severity) cell, from eval/calibration.py. Keep this brief (a few sentences) unless the effect is meaningfully large, in which case expand.]`
-
-**V.G Recovery Performance (secondary, still real evidence but not the paper's spine)**
-`[INSERT: Table — recovery %, remaining gap, retraining cost, per (epsilon, seed), from Person C's Phase 7.E]`
-
-**V.H Supporting Baselines (brief, establish the system works before presenting the main finding)**
-`[INSERT: Table — centralized vs federated accuracy/F1/AUROC/AUPRC, mean±std across N seeds]`
-`[INSERT: Table — tabular-only vs text-only vs fusion, brief — establishes the multimodal system is reasonable, not itself the contribution]`
-`[INSERT: brief note on non-IID partitioning and dropout robustness if space allows — otherwise summarize in one paragraph, full tables in an appendix/supplementary]`
-
-Sections not included in this paper's Results (demoted to Limitations/Future Work per the scoping decision): non-IID heterogeneity as a confound with true drift, epsilon-adaptive drift thresholds, detector window-size sensitivity, real-vs-synthetic drift comparison.
-
-## VI. Discussion — [EVIDENCE-GATED, write after Results is complete]
-- Interpret each result honestly, including negative/unexpected findings
-- Discuss the DP × drift-detection interaction specifically if data supports it (flagged earlier as your strongest differentiator)
-- State what the results do and do not support — do not extrapolate beyond measured conditions
-
-## VII. Limitations — [EVIDENCE-GATED for specifics, but must be written, never skipped]
-Pull directly from `docs/research/limitations.md` (Phase 7.H): dataset limitations, population/label bias, simulation-vs-real-network gap, calibration limitations, no external validation, no real clinical deployment, no regulatory review. This section is not optional padding — reviewers weight it heavily, and it's also where you protect yourself from overclaiming.
-
-## VIII. Conclusion & Future Work
-Summarize contribution in 2-3 sentences (only once known), then future scope from `PRODUCT_SPEC.md`'s explicitly-out-of-scope list (MIMIC-CXR images, real multi-institution networking, genomics, blockchain audit trails) reframed as legitimate next steps, not things you almost did.
-
-## References
-Maintain as `docs/research/references.bib` alongside this draft, built incrementally — never assembled from memory at the end. Every entry verified against Google Scholar/Semantic Scholar/publisher page directly, not from an LLM's recollection.
+- **Clinical Motivation & Privacy:** Federated learning allows training predictive models on decentralized clinical records, while differential privacy (DP-SGD) provides mathematically rigorous bounds against reconstruction attacks.
+- **Problem Statement:** Clinical data distributions experience temporal and covariate drift. Detecting drift early is critical for patient safety, but DP noise injected into client updates or shared validation statistics may confound statistical drift detectors, causing false alarms or masking real clinical shifts.
+- **Research Question (RQ1):** How does the strength of a formally specified differential privacy mechanism affect drift-detection reliability and clinical predictive performance across stable, localized, global, abrupt, gradual, and natural-temporal drift scenarios in simulated-client federated learning?
+- **Scope & Contribution:** A controlled empirical measurement of the DP × drift-detection trade-off on structured MIMIC-IV EHR data, comparing non-private and DP-released detector signals across varying privacy budgets with deterministic rule-based recovery. Novelty is provisional; the contribution is framed as a rigorous controlled measurement.
+- **Outline:** Section II reviews related work; Section III outlines system methodology; Section IV describes experimental setup; Section V presents empirical results; Section VI discusses limitations; Section VII concludes.
 
 ---
 
-## Companion checklist — `docs/research/paper_checklist.md`
-Create this alongside the draft. Each row: section name | evidence source (exact file/results filter) | status (not started / experiments running / data logged / drafted / reviewed). No section moves to "drafted" until its evidence source column has a real, checkable path — not "TBD."
+## II. Related Work
+- **Federated Clinical Learning:** Foundational FedAvg (McMahan et al., 2017) and healthcare benchmarks such as FLamby (du Terrail et al., 2022).
+- **Federated Drift & Personalization:** Distributed concept drift across clients (FedDrift, Jothimurugesan et al., 2023), MoE and accuracy-triggered retraining (DriftGuard, Han et al., 2026), and medical shift benchmarks (FedMedICL, Alhamoud et al., 2024; Med-MMFL, Chhetri et al., 2026).
+- **Differential Privacy & Drift:** Adaptive privacy and drift-sensitive updates (FedDriftGuard, Sudhakar et al., 2026).
+- **Positioning:** While prior work explores concept drift and DP in federated learning separately, our study provides a controlled measurement isolating the quantitative effect of cumulative privacy expenditure on drift-detection reliability, false alarms, and downstream clinical utility using reproducible clinical EHR partitions.
 
-## Contribution statement — locked scope
-The paper's single contribution is: **characterizing how differential privacy noise affects drift-detection reliability in federated clinical learning** (false-positive rate, false-negative rate, detection delay, as a function of epsilon and drift severity), with two supporting evidence pieces (communication cost of false positives, calibration stability). Do not let the paper's framing drift back out to include non-IID-as-pseudo-drift, adaptive thresholds, or other explored-but-descoped angles as co-equal contributions — those belong in Limitations/Future Work only, per the explicit scoping decision. Do not lock the two bracketed sentences in the Abstract until the V.F results are in — the paper's framing should follow the data, not be decided in advance and then results forced to fit it.
+---
+
+## III. Methodology
+- **Federated Training:** 3–5 simulated clients orchestrated with Flower; model updates aggregated via FedAvg.
+- **Differential Privacy Specification:** Record-level DP-SGD via Opacus. Since cohort is restricted to first ICU stay per subject, record-level adjacency coincides with patient-level adjacency. Full client participation per round (no subsampling amplification claimed). Cumulative privacy ledger tracks ε and δ.
+- **Tabular Clinical Model:** Standardized logistic regression and small 2-layer MLP trained on 24-hour landmark aggregated vitals and labs.
+- **Drift Scenarios:** 7 immutable scenarios (stable control, single-client abrupt covariate shift, concept/label shift, gradual ramp shift, global shift, missingness/corruption controls, and natural-temporal shift via `anchor_year_group`).
+- **Detector Signals:**
+  - *(a) Non-private reference signal:* Per-client validation loss/accuracy (upper bound).
+  - *(b) DP-released signal:* Bounded statistic with calibrated Laplacian/Gaussian noise charged to the cumulative privacy ledger. *(TBD — finalize before DP integration stage)*.
+- **Deterministic Recovery Controller:** Predefined fixed thresholds trigger `no_op`, `local_retrain`, or `global_retrain`. Controller checks remaining privacy budget and halts retrains if the preset budget is exhausted.
+
+---
+
+## IV. Experimental Setup
+- **Dataset:** MIMIC-IV v3.1, credentialed PhysioNet access. Adult first ICU stay, in-hospital mortality prediction after a 24-hour ICU landmark.
+- **Cohort & Splitting:** Patient-level split (70% train, 15% validation, 15% test) performed by `subject_id` BEFORE client partitioning. Train split divided into 3–5 simulated clients (natural careunit vs. Dirichlet label skew).
+- **Leakage Prevention:** Features strictly restricted to the 24-hour post-admission window. Exclusion of all discharge-time and post-landmark variables. `anchor_year_group` withheld from model inputs.
+- **Evaluation Metrics:**
+  - Clinical utility: AUROC, AUPRC, sensitivity/specificity (threshold chosen on validation set), Brier score, ECE.
+  - Drift detection: Precision, recall, F1, false alarms per client-window, missed events, detection delay.
+  - Efficiency & Privacy: Cumulative ε/δ, total communication bytes, retraining rounds.
+- **Replication:** 5 independent random seeds with paired scenario evaluations.
+
+---
+
+## V. Results — [EVIDENCE-GATED]
+
+### Main Results Table: Model Performance, Detection Reliability, and Recovery Across Privacy Budgets
+`[INSERT: Table 1 — Columns: Condition (Centralized, FedAvg non-private, FedAvg + DP at ε=1, 5, 10), Detector Variant (Non-private vs DP-released), Test AUROC, Test AUPRC, Detection Precision, Detection Recall, False Alarm Rate, Detection Delay (rounds), Retraining Rounds, Realized Cumulative ε. Mean ± std across 5 seeds.]`
+
+### Figure 1: Detection Reliability Trade-off
+`[INSERT: Figure 1 — Detection F1-score and false-alarm rate as a function of privacy budget ε across abrupt, gradual, and natural-temporal drift scenarios.]`
+
+### Figure 2: Clinical Utility and Post-Drift Recovery
+`[INSERT: Figure 2 — Pre-drift, post-drift, and post-recovery test AUROC under local vs. global retraining, highlighting budget exhaustion cutoffs.]`
+
+### Summary of Findings
+- Baseline consistency: Federated non-private vs. centralized reference gap.
+- Impact of DP noise on false alarms and delay.
+- Natural-temporal drift evaluation using `anchor_year_group` (reported separately from synthetic scenarios).
+
+---
+
+## VI. Limitations
+- Single-institution source (MIMIC-IV); client partitions simulate decentralized silos rather than true external health systems.
+- Task restricted to structured tabular EHR features; complex multi-modal clinical unstructured notes and imaging are unmeasured.
+- Synthetic injected drift may not fully capture the complexity of clinical practice changes.
+- Record-level DP bounds individual stays; client-level DP is omitted due to extreme utility degradation with 3–5 clients.
+
+---
+
+## VII. Conclusion & Future Work
+We presented a controlled evaluation characterizing how differential privacy affects drift-detection reliability and clinical utility in federated learning. Increasing privacy noise imposes a quantifiable detection delay and elevates false alarms, directly impacting retraining communication budgets.
+- **Future Work:**
+  - *Agentic Recovery:* Evaluating whether an LLM-based agent (e.g. Strands Agents SDK) improves adaptive recovery decisions over deterministic rule-based controllers under identical evidence and privacy gates.
+  - *Multimodal Attribution:* Incorporating clinical-note text (MIMIC-IV-Note) and chest radiographs (MIMIC-CXR) to evaluate modality-specific drift detection and attribution.

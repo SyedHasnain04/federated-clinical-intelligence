@@ -13,10 +13,11 @@ Mandatory for every experiment run from Phase 7 onward. This exists because the 
 1. `results/registry.jsonl` has a new line.
 2. That line is valid JSON matching the `ExperimentResult` schema exactly — no missing keys, no extra ad-hoc keys.
 3. `seed`, `git_commit`, `timestamp`, and `dataset_version` are real values, not placeholders — `git_commit` should be the actual `git rev-parse HEAD` at run time, not hardcoded.
-4. `metrics` contains the full dict from `eval/clinical_metrics.py` (+ `eval/calibration.py` where applicable) — never a partial hand-picked subset.
-5. For any experiment run multiple seeds, each seed produces its own separate `ExperimentResult` line — never averaged before storage. Averaging/variance happens downstream in `eval/statistical_comparison.py` and `eval/plots.py`, not at storage time.
+4. `metrics` contains the full dict from `eval/clinical_metrics.py` (AUROC, AUPRC, Brier, ECE, sensitivity, specificity at validation-fixed operating point) — never a partial hand-picked subset.
+5. `scenario_id`, `scenario_type`, `detector_variant`, and `privacy_ledger` are explicitly recorded.
+6. For any experiment run across multiple seeds, each seed produces its own separate `ExperimentResult` line — never averaged before storage. Averaging/variance happens downstream in `eval/statistical_comparison.py` and `eval/plots.py`, not at storage time.
 
-## Standard experiment script skeleton (give this to the agent as the template for every Phase 7 script)
+## Standard experiment script skeleton
 ```python
 import subprocess, datetime
 from eval.results_schema import ExperimentResult, save_result
@@ -24,7 +25,10 @@ from eval.clinical_metrics import compute_metrics
 from eval.calibration import compute_calibration
 
 def get_git_commit():
-    return subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip()
+    try:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip()
+    except Exception:
+        return "unknown"
 
 def run_experiment(seed, config):
     # ... actual training/eval logic ...
@@ -37,32 +41,33 @@ def run_experiment(seed, config):
         timestamp=datetime.datetime.now().isoformat(),
         git_commit=get_git_commit(),
         seed=seed,
-        dataset_version=config["dataset_version"],
-        model=config["model"],
-        training_mode=config["training_mode"],
+        dataset_version=config.get("dataset_version", "MIMIC-IV v3.1"),
+        model=config["model"],                                    # "logistic_regression" | "mlp"
+        training_mode=config["training_mode"],                    # "centralized" | "federated"
+        scenario_id=config.get("scenario_id", "STABLE_CONTROL"),
+        scenario_type=config.get("scenario_type", "stable"),      # "stable" | "abrupt_covariate" | "concept_shift" | "gradual" | "global" | "corruption" | "natural_temporal"
+        detector_variant=config.get("detector_variant", "non_private_reference"), # "non_private_reference" | "dp_released"
         privacy_config=config.get("privacy_config", {}),
+        privacy_ledger=config.get("privacy_ledger", {"cumulative_epsilon": 0.0, "cumulative_delta": 0.0, "rounds_charged": 0}),
         partition_config=config.get("partition_config", {}),
-        drift_config=config.get("drift_config", {}),
         metrics=metrics,
-        runtime_seconds=..., # measured, not estimated
+        detection_metrics=config.get("detection_metrics", {}),
+        recovery_metrics=config.get("recovery_metrics", {}),
+        runtime_seconds=...,                                      # measured, not estimated
         communication_cost=config.get("communication_cost", {}),
     )
     save_result(result)
     print(f"Saved: {result['experiment_id']}")
     return result
-
-if __name__ == "__main__":
-    for seed in [1, 2, 3, 4, 5]:
-        run_experiment(seed, config={...})
 ```
 
 ## Verification step — run this after any batch of experiments, before trusting the results for the paper
-Give the agent this exact instruction:
-
-> Run `python -c "import json; [print(json.loads(l)['experiment_id'], json.loads(l)['seed'], json.loads(l)['metrics']['accuracy']) for l in open('results/registry.jsonl')]"` and show me the full output — I want to see every logged experiment_id, seed, and accuracy value directly, not a summary you wrote yourself, before I trust any of it for the paper.
+```powershell
+python -c "import json; [print(json.loads(l)['experiment_id'], json.loads(l)['seed'], json.loads(l)['metrics']['auroc']) for l in open('results/registry.jsonl')]"
+```
 
 ## What breaks this (things to explicitly forbid)
 - Hardcoding a metric value into a plotting or paper-drafting script instead of reading it from `results/registry.jsonl`
-- Re-running an experiment and overwriting a previous result instead of appending a new record (you want every run kept, even failed/superseded ones, for traceability — never delete `results/registry.jsonl` lines)
+- Re-running an experiment and overwriting a previous result instead of appending a new record (keep every run for traceability — never delete `results/registry.jsonl` lines)
 - Computing an "average" result and storing only the average, discarding per-seed records
-- Any experiment script that can complete successfully without `results/registry.jsonl` growing by at least one line
+- Any experiment script that completes successfully without `results/registry.jsonl` growing by at least one line

@@ -1,8 +1,8 @@
 # EVAL_MODULE_SPEC.md — Shared `eval/` Module (Phase 7+)
 
-All Phase 7+ experiments (centralized, federated, DP, multimodal, drift/recovery, ablation) must call into this single shared module so results are directly comparable. No person computes metrics with their own one-off logic once this exists.
+All Phase 7+ experiments (centralized reference, federated baseline, DP, drift detection/recovery) must call into this single shared module so results are directly comparable. No person computes metrics with their own one-off logic.
 
-Ownership: co-owned. Syed (Person B) leads `clinical_metrics.py` and `calibration.py`. Kiran (Person C) leads `results_schema.py`, `plots.py`, `statistical_comparison.py`, `privacy_utility_table.py`. Ishthiyaq (Person A) leads `communication_cost.py`. Everyone reviews everyone's PR into `eval/` — this is the one shared folder where cross-review is mandatory before merge, per the exception rule in `00_SHARED_REPO_PROTOCOL.md`.
+Ownership: co-owned. Syed (Person B) leads `clinical_metrics.py` and `calibration.py`. Kiran (Person C) leads `detection_metrics.py`, `recovery_metrics.py`, `results_schema.py`, `plots.py`, `statistical_comparison.py`. Ishthiyaq (Person A) leads `communication_cost.py` and `privacy_ledger.py`. Everyone reviews everyone's PR into `eval/`.
 
 ---
 
@@ -10,13 +10,15 @@ Ownership: co-owned. Syed (Person B) leads `clinical_metrics.py` and `calibratio
 ```python
 def compute_metrics(y_true, y_pred_proba, threshold=0.5) -> dict:
     """
-    Returns exactly:
+    Returns clinical classification metrics:
     {
       "accuracy": float, "precision": float, "recall": float, "f1": float,
       "auroc": float, "auprc": float, "sensitivity": float, "specificity": float,
-      "n_samples": int, "positive_rate": float
+      "brier_score": float, "ece": float,
+      "n_samples": int, "positive_rate": float, "threshold": float
     }
-    Never report accuracy alone in any downstream table — always the full dict.
+    Operating point threshold must be chosen on validation set BEFORE evaluating test set.
+    Never report accuracy alone in any downstream table — always report AUROC, AUPRC, Brier, ECE.
     """
 ```
 
@@ -25,8 +27,56 @@ def compute_metrics(y_true, y_pred_proba, threshold=0.5) -> dict:
 def compute_calibration(y_true, y_pred_proba, n_bins=10) -> dict:
     """
     Returns: {"ece": float, "brier_score": float, "reliability_bins": list[dict]}
-    reliability_bins used directly by eval/plots.py — do not hand-build the diagram elsewhere.
+    reliability_bins used directly by eval/plots.py for reliability diagrams.
     """
+```
+
+## `eval/detection_metrics.py` (Kiran)
+```python
+def compute_detection_metrics(ground_truth_events: list[dict], detected_events: list[dict], total_windows: int) -> dict:
+    """
+    Computes drift detection and attribution performance:
+    {
+      "precision": float,
+      "recall": float,
+      "f1": float,
+      "auprc": float,
+      "false_alarms_per_window": float,
+      "missed_event_rate": float,
+      "detection_delay_rounds": float,
+      "client_attribution_accuracy": float  # client-level localization accuracy
+    }
+    """
+```
+
+## `eval/recovery_metrics.py` (Kiran)
+```python
+def compute_recovery_metrics(pre_drift_metric: float, post_drift_metric: float, post_recovery_metric: float, recovery_rounds: int, unnecessary_retrains: int) -> dict:
+    """
+    Quantifies deterministic recovery outcomes:
+    {
+      "pre_drift_score": float,
+      "post_drift_degradation": float,
+      "post_recovery_score": float,
+      "recovery_ratio": float,  # (post_recovery - post_drift) / (pre_drift - post_drift)
+      "recovery_delay_rounds": int,
+      "unnecessary_retrains": int
+    }
+    """
+```
+
+## `eval/privacy_ledger.py` (Ishthiyaq)
+```python
+class PrivacyLedger:
+    """
+    Tracks cumulative epsilon and delta across:
+    - Base training rounds
+    - Detector signal queries (DP-released variant)
+    - Local or global retraining rounds
+    """
+    def log_event(self, round_num: int, event_type: str, epsilon_step: float, delta_step: float) -> dict: ...
+    def get_cumulative_privacy(self) -> dict:
+        """Returns {'cumulative_epsilon': float, 'cumulative_delta': float, 'budget_exhausted': bool}"""
 ```
 
 ## `eval/results_schema.py` (Kiran)
@@ -36,21 +86,26 @@ class ExperimentResult(TypedDict):
     timestamp: str
     git_commit: str
     seed: int
-    dataset_version: str
-    model: str                 # "tabular" | "text" | "multimodal"
-    training_mode: str         # "centralized" | "federated"
-    privacy_config: dict       # {"dp_enabled": bool, "epsilon": float, ...}
-    partition_config: dict     # {"strategy": str, "num_nodes": int, ...}
-    drift_config: dict         # {"injected": bool, "severity": float, "round": int}
-    metrics: dict              # output of compute_metrics() + compute_calibration()
+    dataset_version: str            # e.g. "MIMIC-IV v3.1"
+    model: str                      # "logistic_regression" | "mlp"
+    training_mode: str              # "centralized" | "federated"
+    scenario_id: str                # e.g. "SCENARIO_COVARIATE_ABRUPT_01", "NATURAL_TEMPORAL_01"
+    scenario_type: str              # "stable" | "abrupt_covariate" | "concept_shift" | "gradual" | "global" | "corruption" | "natural_temporal"
+    detector_variant: str           # "non_private_reference" | "dp_released"
+    privacy_config: dict            # {"dp_enabled": bool, "target_epsilon": float, "target_delta": float, "clip_norm": float}
+    privacy_ledger: dict            # {"cumulative_epsilon": float, "cumulative_delta": float, "rounds_charged": int}
+    partition_config: dict          # {"strategy": "natural" | "dirichlet", "num_clients": int, "alpha": float}
+    metrics: dict                   # Pooled and per-client clinical metrics
+    detection_metrics: dict         # Output of compute_detection_metrics()
+    recovery_metrics: dict          # Output of compute_recovery_metrics()
     runtime_seconds: float
-    communication_cost: dict   # output of communication_cost.py, empty dict if centralized
+    communication_cost: dict        # Total bytes, rounds, FLOPs
 
 def save_result(result: ExperimentResult) -> None:
     """Appends to results/registry.jsonl. Never hand-edit this file."""
 
 def load_results(filters: dict = None) -> list[ExperimentResult]:
-    """Used by aggregate-results and generate-plots CLI commands."""
+    """Filters results for tables and plotting."""
 ```
 
 ## `eval/communication_cost.py` (Ishthiyaq)
@@ -64,17 +119,12 @@ def measure_total_cost(rounds: int, num_clients: int, per_round_bytes: int) -> d
 
 ## `eval/plots.py` (Kiran)
 ```python
-def plot_centralized_vs_federated(results: list[ExperimentResult], out_path: str) -> None
-def plot_iid_vs_noniid(results, out_path) -> None
-def plot_dp_tradeoff(results, out_path) -> None
-def plot_dropout_robustness(results, out_path) -> None
-def plot_multimodal_ablation(results, out_path) -> None
-def plot_convergence_curves(results, out_path) -> None
-def plot_drift_detection(results, out_path) -> None
-def plot_recovery_timeline(results, out_path) -> None
-def plot_communication_cost(results, out_path) -> None
+def plot_centralized_vs_federated(results: list[ExperimentResult], out_path: str) -> None: ...
+def plot_dp_tradeoff(results: list[ExperimentResult], out_path: str) -> None: ...
+def plot_drift_detection_roc(results: list[ExperimentResult], out_path: str) -> None: ...
+def plot_recovery_timeline(results: list[ExperimentResult], out_path: str) -> None: ...
+def plot_communication_cost(results: list[ExperimentResult], out_path: str) -> None: ...
 ```
-Rule: every function takes `ExperimentResult` records from `load_results()` — never a manually typed list of numbers. Every plot: labeled axes, units, legend, error bars across seeds where >1 seed exists. Output goes to `results/plots/`, gitignored raw, only final PNGs/SVGs committed.
 
 ## `eval/statistical_comparison.py` (Kiran)
 ```python
@@ -82,25 +132,13 @@ def compare_paired(results_a: list[float], results_b: list[float], test="wilcoxo
     """Returns {"statistic": float, "p_value": float, "effect_size": float, "n": int}."""
 
 def compare_conditions(results: list[ExperimentResult], condition_a: dict, condition_b: dict) -> dict:
-    """Filters results by condition dicts (e.g. {"training_mode":"federated"} vs {"training_mode":"federated","privacy_config.dp_enabled":True}), calls compare_paired on matched seeds."""
-```
-Rule: always report effect size alongside p-value. Never present p<0.05 alone as "proof" without the effect size and raw metric delta stated plainly.
-
-## `eval/privacy_utility_table.py` (Kiran, with Ishthiyaq's DP data)
-```python
-def build_privacy_utility_table(results: list[ExperimentResult]) -> pd.DataFrame:
-    """One row per (epsilon, noise_multiplier) config: epsilon, delta, noise_multiplier,
-    clip_norm, accuracy, f1, auroc, convergence_rounds, wall_clock_seconds."""
+    """Filters results by condition dicts, calls compare_paired on matched seeds."""
 ```
 
 ---
 
 ## Testing requirement for `eval/`
-`tests/test_eval.py` (shared, all 3 add cases for their functions):
-- `compute_metrics` on a hand-computed toy confusion matrix must match manually calculated precision/recall/F1 exactly
-- `save_result`/`load_results` round-trip must preserve every field exactly
-- `compare_paired` on identical distributions must return p≈1.0, effect size≈0
-- every `plots.py` function must run without error on a minimal synthetic `ExperimentResult` list and produce a non-empty file
-
-## Non-negotiable rule for this module
-No experiment script (centralized, federated, DP, drift, ablation) may compute or report a metric that didn't come from `eval/clinical_metrics.py`, `eval/calibration.py`, or `eval/communication_cost.py`. If a new metric is needed, add it here first, write its test, then use it — never inline a one-off calculation in an experiment script.
+`tests/test_eval.py`:
+- `compute_metrics` on a hand-computed toy confusion matrix matches manually calculated precision/recall/F1/AUROC/AUPRC exactly.
+- `PrivacyLedger` correctly accumulates epsilon and stops triggering when budget is exhausted.
+- `compute_detection_metrics` correctly computes false-alarm rate and delay.

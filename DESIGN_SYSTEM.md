@@ -32,11 +32,11 @@ Rule: no gradients, no drop shadows beyond functional focus rings, no decorative
 
 ## Components
 - **Buttons**: transparent background, 0.5px border, hover state fills lightly — the "Inject Drift" button is the one exception that may use the amber/alert color to signal its consequence, since it's the one destructive/triggering action in the UI
-- **Status chips** (node states): small pill, colored background at the light tint of the role color, colored text at the dark tint of the same ramp — never black text on a colored chip
+- **Status chips** (client states): small pill, colored background at the light tint of the role color, colored text at the dark tint of the same ramp — never black text on a colored chip
 - **Charts**: Chart.js or Recharts, flat fills, no 3D effects, always labeled axes with units, legend required whenever more than one series is shown, error bars/variance shown wherever multiple seeds exist (Phase 7+ plots)
 
 ## Icons
-Use a consistent outline icon set (e.g. Tabler icons) throughout — hospital/building icon for nodes, shield icon for privacy panel, alert-triangle for drift, chart icons for training monitor. No emoji anywhere in the UI.
+Use a consistent outline icon set (e.g. Tabler icons) throughout — server/device icon for simulated clients, shield icon for privacy panel, alert-triangle for drift, chart icons for training monitor. No emoji anywhere in the UI.
 
 ## Motion
 Subtle only — chart lines animating in on data update, smooth transitions on status chip color changes. No decorative animation, no bouncing/pulsing effects except a clear, purposeful "training in progress" indicator (e.g. a slow pulse on the teal status chip only).

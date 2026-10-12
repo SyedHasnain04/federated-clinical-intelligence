@@ -3,11 +3,11 @@
 Instructions for any AI coding agent (Claude Code, Cursor, Copilot, etc.) working in this repository. Read this before touching any file.
 
 ## What this project is
-A federated, multimodal, self-evolving clinical intelligence platform. 3-5 simulated hospital nodes train a shared model on MIMIC-IV COVID severity/mortality data without centralizing raw records, combining tabular EHR + clinical notes, with automated drift-triggered retraining.
+Privacy-Aware Drift Detection in Federated Clinical Learning: How Differential Privacy Affects Detection Reliability. 3-5 simulated clients (partitions of one dataset, MIMIC-IV v3.1) train a shared tabular model on adult first ICU stay in-hospital mortality data (24-hour ICU landmark) without centralizing raw records, evaluating how a formally specified differential privacy mechanism affects drift-detection reliability and clinical predictive performance across stable, localized, global, abrupt, gradual, and natural-temporal drift scenarios with deterministic rule-based recovery. (No agent framework or multimodal text/image fusion is part of the core product; Strands and multimodal notes/CXR are future work only.)
 
 ## Before doing anything
 1. Read `00_SHARED_REPO_PROTOCOL.md` — folder ownership, git workflow, error-rectification rule.
-2. Identify which person's plan applies to the current task: `PersonA_Implementation_Plan.md` (federated infra/privacy), `PersonB_Implementation_Plan.md` (multimodal modeling), `PersonC_Implementation_Plan.md` (MLOps/dashboard).
+2. Identify which person's plan applies to the current task: `PersonA_Implementation_Plan.md` (federated infra/privacy), `PersonB_Implementation_Plan.md` (cohort, tabular model, clinical eval), `PersonC_Implementation_Plan.md` (drift scenarios, detectors, recovery controller, results viewer).
 3. If the task is Phase 7+ (research rigor, ablations, statistics), also read `RESEARCH_PROTOCOL.md` and `EVAL_MODULE_SPEC.md`.
 4. Never edit files outside the current person's owned folders (see protocol) except `eval/`, which is co-owned and requires cross-review.
 

@@ -1,81 +1,83 @@
 # Person B — Prompt Guide (use with code agent, in order, per phase)
 
 Before every phase: `git checkout main && git pull origin main`, then branch per 00_SHARED_REPO_PROTOCOL.md.
+Simulated clients are partitions of one dataset, never "hospitals" or "hospital silos".
+Modality: Structured MIMIC-IV tabular EHR only (24h ICU landmark). Notes/fusion are future work.
 
 ---
 
 ## Phase 1
 
 **Prompt 1 (build):**
-> Pull the latest main and show me the contents of `models/model_interface.py` and `client/client_app.py` written by a teammate. Confirm whether a standard PyTorch `nn.Module` with `.state_dict()`/`.load_state_dict()` fits their expected format — flag explicitly if it doesn't. Then create `models/tabular.py`, `models/text.py`, `models/fusion.py` as stub classes: `class TabularEncoder(nn.Module)`, `class TextEncoder(nn.Module)`, `class FusionModel(nn.Module)`, each with `__init__` and `forward` only (no real logic yet), and a docstring stating expected input/output shape. Add a one-line comment at the top of `models/text.py` recording the decision: frozen ClinicalBERT vs lightweight TF-IDF/BiLSTM, and why, given [state your compute budget].
+> Create `data/mock_schema.py` implementing `generate_mock_data(n_stays: int = 3000, seed: int = 42) -> pd.DataFrame` producing a synthetic table with columns: `subject_id`, `hadm_id`, `stay_id`, `first_careunit`, `anchor_year_group`, `age`, `gender`, 24h vitals/labs (min, max, mean), `in_hospital_mortality`, `landmark_time`. Mortality prevalence ~10–15%. Then implement `data/cohort.py` with `build_cohort(source: str, mimic_dir: str | None, seed: int) -> pd.DataFrame` extracting adult first ICU stays (age >= 18), 24h landmark (exclude stays < 24h), no post-landmark features, saving cohort flow counts to `data/cohort_flow.json` and documenting `docs/research/cohort_spec.md`.
 
 **Prompt 2 (test + fix loop):**
-> Write `tests/test_models.py::test_imports` that instantiates all three stub classes with dummy dimensions and asserts `forward()` on random tensors returns tensors of the documented shape. Run `pytest tests/test_models.py::test_imports -v`. Fix any failures and re-run until green.
+> Write `tests/test_cohort.py` asserting: (1) no stay < 24h, (2) all subjects age >= 18, (3) exactly one stay per subject_id, (4) `anchor_year_group` populated for every row, (5) no future/discharge leakage features. Run `pytest tests/test_cohort.py -v`. Fix failures and re-run until green.
 
 **Prompt 3 (push):**
-> Commit as "phase1: model stubs + contract review", push to `feature/personB-phase1-stubs`, open PR noting any contract concerns for Person A to review.
+> Show me `data/cohort_flow.json` and 10 sample feature rows. Commit as "phase1: mock schema + cohort derivation", push to `feature/personB-phase1-cohort`, open PR.
 
 ---
 
 ## Phase 2
 
 **Prompt 1 (build):**
-> Write `data/preprocessing.py` with `def preprocess_tabular(df, fit_stats=None) -> (df_clean, fit_stats)` (impute/normalize, computing stats fresh if `fit_stats` is None — never use global stats across nodes) and `def preprocess_text(notes: list[str]) -> list[str]` (clean whitespace/non-printable chars). Write a script that runs this over each `data/nodes/node_{i}/data.parquet` from Person A's partitioning output and writes `data/nodes/node_{i}/data_clean.parquet`.
+> Write `data/split.py` implementing `patient_level_split(df, seed, frac=(0.7, 0.15, 0.15)) -> (train_df, val_df, test_df)` split strictly by `subject_id` BEFORE partitioning. Save split IDs to gitignored path `data/splits/`. Write `data/partition.py` implementing `partition_clients(train_df, num_clients, strategy, seed) -> dict[int, pd.DataFrame]` supporting "natural" (by `first_careunit`) and "dirichlet" (label skew). Partition TRAIN only; val and test stay global. Write `data/nodes/client_{i}/data.parquet` and report `data/partition_report.json`.
 
 **Prompt 2 (test + fix loop):**
-> Write `tests/test_preprocessing.py` asserting: (1) zero nulls remain post-cleaning, (2) running `preprocess_tabular` separately on node 0 vs node 1 data produces different `fit_stats` (proves no cross-node leakage), (3) text cleaning strips injected noise (non-printable chars, extra whitespace) from a synthetic test string. Run `pytest tests/test_preprocessing.py -v`. If test 2 fails (stats identical across nodes), this is a leakage bug — fix and re-run until it passes, do not skip this.
+> Write `tests/test_partition.py` asserting: (1) no `subject_id` overlap between train/val/test, (2) no `subject_id` overlap across client partitions, (3) client partition union equals train split, (4) val and test sets are never partitioned. Run `pytest tests/test_partition.py -v`. Re-run until green.
 
 **Prompt 3 (push):**
-> Print 5 sample before/after records (mixed tabular + text) so I can review them directly in your response before I commit. Then commit as "phase2: preprocessing pipeline", push to `feature/personB-phase2-preprocessing`, open PR with the sample output pasted in.
+> Commit as "phase2: patient split and client partitioning", push to `feature/personB-phase2-partition`, open PR.
 
 ---
 
 ## Phase 3
 
 **Prompt 1 (build):**
-> Implement `models/tabular.py`'s `TabularEncoder(nn.Module)`: `__init__(self, input_dim, hidden_dims=[64,32], output_dim=16, mode="embedding")`, MLP, `mode="embedding"` returns a 16-dim vector, `mode="logit"` returns a single sigmoid logit. Write `models/train_centralized_tabular.py`: loads all nodes' cleaned data combined, trains `TabularEncoder(mode="logit")` centrally with a standard train/val split, reports accuracy/precision/recall/F1, saves results to `models/baselines/tabular_centralized_metrics.json`.
+> Implement `models/baseline.py` defining `LogisticRegressionModel` and `MLPModel` (2 hidden layers) behind standard interface: `fit`, `predict_proba`, `get_parameters`, `set_parameters`. Implement median imputation and standard scaling fit on TRAIN only. Ensure `anchor_year_group`, IDs, and `landmark_time` are excluded from model features.
 
 **Prompt 2 (test + fix loop):**
-> Write tests for both modes' output shapes, confirm a 5-epoch training run on synthetic data has non-NaN, decreasing loss, and confirm save/load round-trip gives identical predictions on a fixed input. Run them, fix failures, re-run until green. Then actually run `train_centralized_tabular.py` and show me the full metrics output.
+> Write `tests/test_models.py` asserting: (1) forward pass shapes, (2) non-NaN loss over training runs, (3) `get_parameters` / `set_parameters` round-trip preserves exact predictions, (4) imputation/scaling statistics differ per client and never touch val/test. Run `pytest tests/test_models.py -v`. Fix and re-run until green.
 
 **Prompt 3 (push):**
-> Commit as "phase3: tabular branch + centralized baseline", push to `feature/personB-phase3-tabular`, open PR with the baseline metrics in the description.
+> Commit as "phase3: tabular baseline models", push to `feature/personB-phase3-models`, open PR.
 
 ---
 
 ## Phase 4
 
 **Prompt 1 (build):**
-> Implement `models/text.py`'s `TextEncoder(nn.Module)` using [frozen Bio_ClinicalBERT / TF-IDF+MLP — per Phase 1 decision]. If ClinicalBERT: freeze all weights, `forward(input_ids, attention_mask)` returns 768-dim pooled embedding. Write `models/embedding_cache.py` with `get_or_compute_embedding(note_id, text)` caching to `data/nodes/node_{i}/text_embeddings.npz` so repeated calls don't recompute.
+> Implement `eval/clinical_metrics.py` with `compute_metrics(y_true, y_pred_proba, threshold=0.5)` returning `accuracy`, `precision`, `recall`, `f1`, `auroc`, `auprc`, `sensitivity`, `specificity`, `brier_score`, `ece`. Support operating point threshold selection on validation split before testing. Implement `eval/calibration.py` with `compute_calibration()`.
 
 **Prompt 2 (test + fix loop):**
-> Write tests: output shape/dtype correctness, cache-hit returns identical array on repeated calls for the same note_id. Also write a small script computing cosine similarity between 3 pairs of similar-topic clinical notes and 3 pairs of clearly unrelated notes, and assert the similar-pair average similarity is higher than the unrelated-pair average. Run everything, fix failures, and show me the actual similarity numbers and the note text pairs used, so I can read them myself.
+> Write `tests/test_eval.py` asserting `compute_metrics` on a toy confusion matrix matches hand-computed values exactly. Run `pytest tests/test_eval.py -v`. Re-run until green.
 
 **Prompt 3 (push):**
-> Commit as "phase4: text branch + embedding cache", push to `feature/personB-phase4-text`, open PR with the cosine-similarity sanity check output included.
+> Commit as "phase4: clinical metrics and calibration", push to `feature/personB-phase4-metrics`, open PR.
 
 ---
 
-## Phase 5 (coordinate live with Person A before running Prompt 3)
+## Phase 5 (Centralized Baseline & Joint Federated Integration)
 
 **Prompt 1 (build):**
-> Implement `models/fusion.py`'s `FusionModel(nn.Module)`: `__init__(self, tabular_dim=16, text_dim=[64 or 768], hidden_dim=32)`, concatenates `TabularEncoder(mode="embedding")` and `TextEncoder` outputs, MLP head to 1 sigmoid logit. Write `models/train_centralized_ablation.py` training and comparing tabular-only, text-only, and fusion configs, saving results to `models/baselines/ablation_results.json`.
+> Implement `experiments/run_centralized_baseline.py` training Logistic Regression and MLP on full train split and evaluating on global test split across 5 seeds. Log results to `results/registry.jsonl` using `save_result()`. Print last registry line and summary table (model × seed × metric, mean ± std). Jointly with Person A, wrap `models/baseline.py` in Flower client to run FedAvg non-private across 3–5 clients.
 
 **Prompt 2 (test + fix loop):**
-> Write a shape/type test for `FusionModel.forward()`. Run the ablation script and show me the full 3-way results table. If any config trains to a degenerate result (NaN, near-random for all 3), diagnose and fix before proceeding — but if fusion genuinely underperforms tabular-only, do NOT tune it until it "wins"; report the honest result.
+> Run `python experiments/run_centralized_baseline.py`. Verify `results/registry.jsonl` appends 5 records per model. Check that test AUROC falls in the published range (~0.8–0.9). Run `pytest tests/test_models.py -v`.
 
-**Prompt 3 (push, after live session with Person A):**
-> [Do this together with Person A live] Import `FusionModel` into `server/run_simulation.py` and run one full federated round together — fix any interface mismatches on my side to match the agreed contract exactly. Once it runs clean, commit as "phase5: fusion model + federated integration", push to `feature/personB-phase5-fusion`, open PR noting it needs Person A's sign-off, and paste the ablation table in the description.
+**Prompt 3 (push):**
+> Commit as "phase5: centralized baseline and federated integration", push to `feature/personB-phase5-baseline`, open PR with baseline metrics table.
 
 ---
 
 ## Phase 6
 
 **Prompt 1 (build):**
-> Extend `models/train_centralized_ablation.py` to also run each config with Person A's DP wrapper (`privacy/dp_wrapper.py`) on and off, appending results to `ablation_results.json`. Write `models/inference.py`'s `predict(tabular_input: dict, note_text: str, checkpoint_path: str) -> dict` returning prediction, confidence, top contributing tabular features (simple SHAP), and top contributing text tokens (attention-weight based). Export the best-performing checkpoint to `models/checkpoints/final_fusion_model.pt`.
+> Replace all `print()` with `logging` calls. Update `models/README.md` and `data/README.md`. Finalize `docs/research/cohort_spec.md`.
 
 **Prompt 2 (test + fix loop):**
-> Write 5 hardcoded example inputs (mix of clearly-low-risk and clearly-high-risk profiles) and run `predict()` on each. Show me the full output for all 5 so I can manually judge whether the predictions look sane before trusting the checkpoint for the demo. Fix and re-run if any look wrong or error out.
+> Run full test suite for Person B: `pytest tests/test_cohort.py tests/test_partition.py tests/test_models.py tests/test_eval.py -v`.
 
 **Prompt 3 (push):**
-> Write `models/README.md` covering architecture, final ablation table, and checkpoint loading instructions. Run the full `tests/test_models.py` suite one more time. Commit as "phase6: inference + docs + final checkpoint", push to `feature/personB-phase6-final`, open PR, and after I approve, merge to main.
+> Commit as "phase6: hardening and docs", push to `feature/personB-phase6-final`, open PR.

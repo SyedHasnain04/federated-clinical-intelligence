@@ -1,76 +1,89 @@
-# Federated Clinical Intelligence Platform
+# Privacy-Aware Drift Detection in Federated Clinical Learning: How Differential Privacy Affects Detection Reliability
 
-A self-evolving, privacy-preserving, multimodal clinical intelligence system. Simulated hospital nodes collaboratively train a shared severity/mortality prediction model on MIMIC-IV COVID-19 data — combining structured EHR data and clinical notes — without any node's raw patient data ever leaving that node, and with automated drift detection that triggers self-recovery through retraining.
+A controlled experimental benchmark studying **RQ1**: how does a formally specified differential privacy (DP) mechanism affect drift-detection reliability and clinical predictive performance across stable, localized, global, abrupt, gradual, and natural-temporal drift scenarios in simulated-client federated learning?
 
-Final-year capstone project — G. Pulla Reddy Engineering College, CSE (ML).
+Target: Regional IEEE conference paper (4–6 pages, IEEE two-column format). Scope: RQ1 only. (Agentic recovery and multimodal notes/images are future work).
 
-## Team
+---
+
+## Core Research Question
+**RQ1:** How does the strength of a formally specified differential privacy mechanism affect drift-detection reliability and clinical predictive performance across stable, localized, global, abrupt, gradual, and natural-temporal drift scenarios in simulated-client federated learning?
+
+- **Task:** Adult first ICU stay, in-hospital mortality prediction after a 24-hour ICU landmark.
+- **Dataset:** MIMIC-IV v3.1 (credentialed PhysioNet access).
+- **Simulated Clients:** 3–5 partitions of one dataset (never independent "hospitals").
+- **Privacy Mechanism:** Record-level DP-SGD via Opacus (coinciding with patient-level adjacency on first ICU stays). Cumulative privacy ledger tracks expenditure across base training, detector queries, and retraining rounds.
+- **Detector Signals:** Compared between (a) non-private reference signal (per-client validation loss/accuracy) and (b) DP-released signal (bounded statistic + calibrated noise charged to privacy ledger).
+- **Recovery:** One deterministic rule-based controller (no-op, local retraining, global retraining) that refuses retraining when preset cumulative privacy budgets are exhausted.
+- **Novelty Status:** PROVISIONAL. Framed as a controlled empirical measurement. Closest prior works: FedDriftGuard, DriftGuard, FedDrift, FedMM, FedMedICL, Med-MMFL, FLamby. Stage 0 ("Literature closure") is the first milestone.
+
+---
+
+## Team & Module Ownership
 | Role | Person | Owns |
 |---|---|---|
-| Federated Infrastructure & Privacy | Ishthiyaq | `server/`, `client/`, `privacy/` — builds/tests against synthetic mock data |
-| Multimodal Modeling & Dataset | Syed Hasnain | `models/`, `data/` (preprocessing, partitioning, mock schema) — **sole holder of real MIMIC-IV access** |
-| Self-Evolving Loop, MLOps & Product | Kiran | `monitoring/`, `dashboard/`, `infra/`, CI/CD — builds/tests against synthetic mock data |
+| Federated Infrastructure & Privacy | Ishthiyaq (Person A) | `server/`, `client/`, `privacy/` — Flower FedAvg, Opacus DP-SGD, privacy accountant cross-check, cumulative privacy ledger, communication bytes logging. |
+| Cohort, Tabular Modeling & Clinical Eval | Syed Hasnain (Person B) | `models/`, `data/`, `eval/clinical_metrics.py`, `eval/calibration.py` — **Sole holder of real MIMIC-IV access.** Cohort derivation (24h landmark, anchor_year_group), patient-level split before partitioning, tabular models (LogReg & MLP), centralized baseline, mock schema for teammates. |
+| Drift Scenarios, Detectors & Recovery | Kiran (Person C) | `monitoring/`, `dashboard/` (minimal viewer), `eval/detection_metrics.py`, `eval/recovery_metrics.py`, results registry. Drift scenario generator (synthetic + natural-temporal), detectors, deterministic rule-based recovery controller. |
+
+---
 
 ## What this demonstrates
-1. **Federated learning works across non-IID hospital-like data splits** without centralizing raw records.
-2. **Multimodal fusion** (tabular + text) improves over single-modality baselines.
-3. **Differential privacy** can be applied client-side with a measured, honestly-reported utility cost.
-4. **The system detects data drift and recovers automatically** through triggered retraining — demonstrated live via the dashboard's Inject Drift control.
+1. **Federated learning across client partitions:** Tabular clinical models train collaboratively without centralizing raw patient records.
+2. **Formal privacy accounting:** Record-level DP bounds individual stays with cumulative accounting across rounds and detector queries.
+3. **Detection reliability trade-off:** Quantitative measurement of detection delay, false alarm rates, precision, and recall as privacy noise increases.
+4. **Budget-constrained recovery:** Deterministic retraining improves post-drift clinical utility while strictly honoring cumulative privacy limits.
+
+---
 
 ## Repo structure
 ```
-server/, client/, privacy/     Federated orchestration, DP (Person A)
-models/, data/                 Multimodal models, preprocessing (Person B)
-monitoring/, dashboard/, infra/ Drift detection, dashboard, Docker/CI (Person C)
+server/, client/, privacy/     Flower orchestration, record-level DP-SGD, privacy ledger (Person A)
+data/, models/                 Cohort derivation, patient split, tabular models (Person B)
+monitoring/, dashboard/        Drift scenarios, dual detectors, rule-based controller (Person C)
 config/                        Shared configuration (config/base.yaml)
-eval/, experiments/, results/  Phase 7+ research rigor (see RESEARCH_PROTOCOL.md)
-tests/                         Test suite, one file per module
+eval/, experiments/, results/  Shared metrics, experiment runners, results registry (Phase 7+)
+tests/                         Test suite per module
+docs/research/                 Research plan, cohort spec, limitations, paper draft
 ```
+
+---
 
 ## Documentation index
 | Read this... | For... |
 |---|---|
-| `PRODUCT_SPEC.md` | What we're building, for whom, and scope boundaries |
-| `TECH_ARCHITECTURE.md` | System diagram, module ownership, data flow guarantees |
-| `UI_UX_SPEC.md` / `DESIGN_SYSTEM.md` | Dashboard panels and visual design |
-| `AI_EXPERIENCE_SPEC.md` | Rules for presenting predictions/drift claims honestly |
-| `IMPLEMENTATION_PLAN.md` | Week-by-week build plan, links to per-role detail docs |
-| `00_SHARED_REPO_PROTOCOL.md` | Git workflow, folder ownership rules |
-| `RESEARCH_PROTOCOL.md` / `EVAL_MODULE_SPEC.md` | Phase 7+ statistical rigor and evaluation |
-| `QUALITY_BAR.md` | What "done" actually means at every level |
-| `AGENTS.md` | Instructions for AI coding agents working in this repo |
+| `PRODUCT_SPEC.md` | Research scope, problem definition, and boundaries |
+| `TECH_ARCHITECTURE.md` | System diagram, module boundaries, data flow and privacy guarantees |
+| `IMPLEMENTATION_PLAN.md` | Phased build plan and schedule (8–10 weeks) |
+| `00_SHARED_REPO_PROTOCOL.md` | Git workflow, folder ownership, error-rectification rules |
+| `RESEARCH_PROTOCOL.md` | Master contract, Hard Rules (Section 39), Phase 7+ experimental rigor |
+| `EVAL_MODULE_SPEC.md` | Shared clinical, detection, recovery, and privacy metrics specification |
+| `RESULTS_STORAGE_SPEC.md` | Required structure for `results/registry.jsonl` entries |
+| `QUALITY_BAR.md` | Definition of done, reproducibility checklist, claim-to-evidence map |
+| `AGENTS.md` | Standing instructions for AI coding agents |
+| `docs/research/RESEARCH_PLAN.md` | Full research plan converted from docx (source of truth) |
+| `docs/research/PAPER_DRAFT.md` | IEEE 4–6 page conference paper draft scaffold |
+
+---
 
 ## Setup (from a fresh clone)
 ```bash
-git clone https://github.com/Syed8855/federated-clinical-intelligence.git
+git clone https://github.com/SyedHasnain04/federated-clinical-intelligence.git
 cd federated-clinical-intelligence
 python -m venv venv
-source venv/bin/activate        # Windows: venv\Scripts\activate
+# Windows:
+.\venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
-## Running the full simulation
-```bash
-docker-compose -f infra/docker-compose.yml up
-```
-This starts 1 server container + N node containers (`NUM_NODES` env var, default 4) on a shared network.
+---
 
-## Running the dashboard
+## Running the Centralized Reference Baseline
 ```bash
-# once infra is up
-open http://localhost:<PORT>   # exact port set in infra/docker-compose.yml
+python experiments/run_centralized_baseline.py --seeds 5
 ```
 
-## Demo runbook (self-recovery cycle)
-1. Start the full stack: `docker-compose -f infra/docker-compose.yml up`
-2. Open the dashboard, wait for the Network Overview to show all nodes Active
-3. Watch the Training Monitor climb toward the centralized baseline line
-4. Click **Inject Drift** on the Drift Timeline panel
-5. Observe: a node flips to "Drift Detected" (amber), a retraining round fires, accuracy dips then recovers — typically within a few rounds
-6. Try the Inference Panel with sample tabular + note input to see a live prediction with confidence and interpretability output
-
-## Status
-Actively in development. See `IMPLEMENTATION_PLAN.md` for current phase status per role.
+---
 
 ## Limitations
-This is a research/educational simulation, not a validated clinical tool — no prediction from this system should inform real patient care. See `docs/research/limitations.md` (added in Phase 7+) for the full, honest accounting of dataset, privacy, and validation limitations.
+This benchmark evaluates simulated partitions of MIMIC-IV on a single institution's cohort, not multi-center hospital deployments. Predictions are research prototypes and not for clinical decision-making. Agentic recovery (Strands SDK) and multimodal clinical notes/imaging are deferred to future work.
