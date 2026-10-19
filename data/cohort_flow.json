@@ -1,0 +1,7 @@
+{
+  "all_stays": 4500,
+  "adults": 4292,
+  "first_icu_stay": 2454,
+  "landmark_gte_24h": 1764,
+  "final_cohort": 1764
+}
