@@ -1,27 +1,25 @@
 # Database Foundation Plan: Relational Core for Federated Multimodal Clinical Intelligence
 
-**Status:** Under Review (Awaiting User Approval for Phase 2 Implementation)  
+**Status:** Implemented & Validated (Core Relational Schema Milestone Complete)  
 **Role:** Person B (Multimodal Modeling & Core Data Foundation)  
 **Target Dataset:** MIMIC-IV v3.1 (`hosp` and `icu` modules)  
-**Engine:** PostgreSQL 15+ / 16+  
-**Target Date:** 2026-10-30  
+**Engine:** PostgreSQL 15+ / 16+ (with isolated SQLite supplemental engine for fast local validation)  
+**Date:** 2026-10-30  
 
 ---
 
 ## 1. Executive Summary
 
-This plan outlines the foundational relational architecture for the **Self-Evolving Federated Multimodal Clinical Intelligence Platform**. The current stage focuses exclusively on building a rigorous, modular, testable relational schema in PostgreSQL using authorized MIMIC-IV v3.1 table structures before advancing to machine learning pipelines, federated orchestration, or multimodal fusion.
+This document specifies and records the implementation of the core relational database foundation for the **Self-Evolving Federated Multimodal Clinical Intelligence Platform**. The current milestone delivers a rigorous, modular, testable relational schema in PostgreSQL matching MIMIC-IV v3.1 table structures (`patients`, `admissions`, `diagnoses_icd`, `icustays`, `labevents`, `chartevents`), accompanied by SQLAlchemy 2.0 ORM models, migration scripts, a deterministic synthetic relational cohort generator, and an automated test suite.
 
-Following the mandatory safety guidelines:
+Safety guarantees maintained:
 - The existing prototype synthetic cohort in `data/` is preserved untouched.
-- No real MIMIC-IV patient-level data, credentials, or private configuration will be committed to git.
-- Database changes will take place in an isolated development environment and will only begin following explicit user review and approval.
+- No real MIMIC-IV patient-level data, credentials, or private configuration have been committed to git.
+- Full automated test validation passed cleanly (29/29 tests green across the entire workspace).
 
 ---
 
 ## 2. Phase 1 Inspection: Existing Codebase & Prototype Cohort
-
-An exhaustive inspection of the workspace was conducted prior to making any changes:
 
 ### 2.1 Workspace Structure
 ```
@@ -62,18 +60,13 @@ repo/
    - Serialized columnar files: Apache Parquet (`data/nodes/client_*/data.parquet`).
    - JSON summary files: `data/cohort_flow.json`, `data/partition_report.json`, and `data/splits/split_seed_*.json`.
 3. **Data Representation:** The prototype cohort is a **flattened feature matrix** designed for model training (51 summary features: min, max, mean for 7 vitals and 10 labs, plus demographics and an `in_hospital_mortality` label). It does not maintain relational normalization, longitudinal raw event streams, or relational constraints.
-4. **Safety Confirmation:** This prototype cohort will remain untouched in `data/`. All existing unit tests (`pytest tests/`) currently pass (16/16).
-
-### 2.3 Reusable Code & Existing Work
-- **Clinical Constants:** Care unit definitions (`CAREUNITS = ["MICU", "SICU", "CCU", "CVICU", "TSICU"]`) and census anchor year groups (`ANCHOR_YEAR_GROUPS = ["2008 - 2010", "2011 - 2013", "2014 - 2016", "2017 - 2019"]`) in `data/mock_schema.py`.
-- **Physiological Priors:** Realistic statistical ranges for heart rate, blood pressures, respiratory rate, body temperature, SpO2, and 10 routine lab tests (glucose, potassium, sodium, chloride, BUN, creatinine, WBC, hemoglobin, platelet count, bicarbonate).
-- **Patient Exclusion Logic:** Standardized criteria for adult selection (`age >= 18`), first chronological ICU stay restriction, and 24-hour landmark observation window (`data/cohort.py`).
+4. **Safety Confirmation:** This prototype cohort remains untouched in `data/`. All existing unit tests (`pytest tests/`) continue to pass cleanly (16/16).
 
 ---
 
-## 3. Proposed Project Architecture and File Structure
+## 3. Implemented Project Architecture
 
-To integrate cleanly into Person B's data ownership boundaries without disrupting existing modeling or federated modules, the relational database foundation will be structured as a dedicated, modular subpackage:
+The relational database foundation is implemented within a dedicated `database/` package:
 
 ```
 database/
@@ -81,28 +74,30 @@ database/
 ├── schema.sql                      # Idempotent PostgreSQL DDL script (tables, constraints, indexes)
 ├── connection.py                   # Engine & connection pool configuration using environment variables
 ├── models.py                       # SQLAlchemy 2.0 declarative ORM models matching the 6 core tables
+├── staging.py                      # Unconstrained staging schema & data verification utilities
 ├── migrations/
 │   ├── __init__.py
 │   ├── env.py                      # Migration environment configuration
+│   ├── runner.py                   # Programmatic migration runner
 │   └── versions/
-│       └── 001_initial_core_schema.py # Initial versioned migration
+│       └── 001_initial_core_schema.py # Initial versioned migration (upgrade & downgrade)
 ├── synthetic/
 │   ├── __init__.py
 │   └── relational_generator.py     # Deterministic generator producing normalized records for all 6 tables
 ├── tests/
 │   ├── __init__.py
-│   ├── conftest.py                 # Pytest fixtures, test database setup/teardown
-│   └── test_relational_schema.py   # Comprehensive automated tests for PKs, FKs, types, and constraints
-├── docs/
-│   ├── DATA_DICTIONARY.md          # Complete data dictionary for all tables and attributes
-│   └── README.md                   # Setup guide, runbook, and migration documentation
+│   ├── conftest.py                 # Pytest fixtures and dual-mode test engine setup/teardown
+│   └── test_relational_schema.py   # 13 automated tests for PKs, FKs, types, constraints, and imports
+└── docs/
+    ├── DATA_DICTIONARY.md          # Complete data dictionary for all tables and attributes
+    └── README.md                   # Setup guide, runbook, and migration documentation
 ```
 
 ---
 
-## 4. Proposed Core PostgreSQL Relational Schema
+## 4. PostgreSQL Relational Schema & Entity Relationships
 
-The core schema defines six initial tables derived from MIMIC-IV v3.1 `hosp` and `icu` modules.
+The schema defines six core tables derived from MIMIC-IV v3.1 `hosp` and `icu` modules with strict referential constraints:
 
 ```
                     ┌────────────────────────┐
@@ -118,6 +113,7 @@ The core schema defines six initial tables derived from MIMIC-IV v3.1 `hosp` and
                     │────────────────────────│
                     │ PK  hadm_id            │
                     │ FK  subject_id         │
+                    │ UQ  (hadm_id, subj_id) │
                     └───────┬────────┬───────┘
                             │        │
            ┌────────────────┘        └────────────────┐
@@ -128,235 +124,115 @@ The core schema defines six initial tables derived from MIMIC-IV v3.1 `hosp` and
 │     diagnoses_icd      │                 │        icustays        │
 │────────────────────────│                 │────────────────────────│
 │ PK  (subject_id,       │                 │ PK  stay_id            │
-│      hadm_id,          │                 │ FK  subject_id         │
-│      seq_num,          │                 │ FK  hadm_id            │
+│      hadm_id,          │                 │ FK  (hadm_id, subj_id) │
+│      seq_num,          │                 │ UQ  (stay, hadm, subj) │
 │      icd_version)      │                 └───────────┬────────────┘
-│ FK  subject_id         │                             │ 1
-│ FK  hadm_id            │                             │
-└────────────────────────┘                             │ N
-           │                                ┌──────────▼─────────────┐
-           │ 1                              │      chartevents       │
-           │                                │────────────────────────│
-           │ N (nullable hadm_id)           │ PK  surrogate_id       │
-┌──────────▼─────────────┐                  │ FK  subject_id         │
-│       labevents        │                  │ FK  hadm_id            │
-│────────────────────────│                  │ FK  stay_id            │
-│ PK  surrogate_id       │                  └────────────────────────┘
+│ FK  (hadm_id, subj_id) │                             │ 1
+└────────────────────────┘                             │
+           │                                           │ N
+           │ 1                              ┌──────────▼─────────────┐
+           │                                │      chartevents       │
+           │ N                              │────────────────────────│
+┌──────────▼─────────────┐                  │ PK  chartevent_id      │
+│       labevents        │                  │ FK  (stay, hadm, subj) │
+│────────────────────────│                  └────────────────────────┘
+│ PK  labevent_surr_id   │
 │ Cand labevent_id       │
-│ FK  subject_id         │
-│ FK  hadm_id (NULLABLE) │
+│ FK  (hadm_id, subj_id) │ (Nullable hadm_id under MATCH SIMPLE)
 └────────────────────────┘
 ```
 
-### Table 1: `patients`
-- **Source:** `hosp/patients.csv.gz`
-- **Columns & Data Types:**
-  - `subject_id` (`INTEGER` / `BIGINT`, `NOT NULL`, **PRIMARY KEY**): Unique patient identifier.
-  - `gender` (`VARCHAR(1)`, `NOT NULL`): Biological sex ('M', 'F').
-  - `anchor_age` (`SMALLINT`, `NOT NULL`): Age during the anchor year.
-  - `anchor_year` (`SMALLINT`, `NOT NULL`): De-identified anchor year.
-  - `anchor_year_group` (`VARCHAR(20)`, `NOT NULL`): Year range (e.g., '2008 - 2010').
-  - `dod` (`DATE`, `NULL`): Date of death (null if patient survived past recording window).
-- **Semantics:** 1 row per unique patient.
-
-### Table 2: `admissions`
-- **Source:** `hosp/admissions.csv.gz`
-- **Columns & Data Types:**
-  - `hadm_id` (`INTEGER` / `BIGINT`, `NOT NULL`, **PRIMARY KEY**): Unique hospital admission identifier.
-  - `subject_id` (`INTEGER` / `BIGINT`, `NOT NULL`, **FOREIGN KEY -> patients.subject_id**): Patient reference.
-  - `admittime` (`TIMESTAMP WITHOUT TIME ZONE`, `NOT NULL`): Time of hospital admission.
-  - `dischtime` (`TIMESTAMP WITHOUT TIME ZONE`, `NULL`): Time of hospital discharge.
-  - `deathtime` (`TIMESTAMP WITHOUT TIME ZONE`, `NULL`): Time of in-hospital death.
-  - `admission_type` (`VARCHAR(40)`, `NOT NULL`): E.g., 'EMERGENCY', 'ELECTIVE', 'URGENT'.
-  - `admit_provider_id` (`VARCHAR(20)`, `NULL`): Ordering physician identifier.
-  - `admission_location` (`VARCHAR(60)`, `NULL`): Physical location prior to admission.
-  - `discharge_location` (`VARCHAR(60)`, `NULL`): Disposition upon discharge.
-  - `insurance` (`VARCHAR(40)`, `NULL`): Health insurance category.
-  - `language` (`VARCHAR(30)`, `NULL`): Primary spoken language.
-  - `marital_status` (`VARCHAR(30)`, `NULL`): Marital status.
-  - `race` (`VARCHAR(80)`, `NULL`): Reported race/ethnicity.
-  - `edregtime` (`TIMESTAMP WITHOUT TIME ZONE`, `NULL`): Emergency department registration time.
-  - `edouttime` (`TIMESTAMP WITHOUT TIME ZONE`, `NULL`): Emergency department departure time.
-  - `hospital_expire_flag` (`SMALLINT`, `NOT NULL`, default 0): Binary indicator (1 = died in hospital).
-- **Constraints & Indexes:**
-  - Foreign Key: `FOREIGN KEY (subject_id) REFERENCES patients(subject_id) ON DELETE RESTRICT`.
-  - Check constraint: `CHECK (hospital_expire_flag IN (0, 1))`.
-  - Indexes: `CREATE INDEX idx_admissions_subject_id ON admissions(subject_id);`
-  - `CREATE INDEX idx_admissions_admittime ON admissions(admittime);`
-
-### Table 3: `diagnoses_icd`
-- **Source:** `hosp/diagnoses_icd.csv.gz`
-- **Columns & Data Types:**
-  - `subject_id` (`INTEGER` / `BIGINT`, `NOT NULL`, **FOREIGN KEY -> patients.subject_id**).
-  - `hadm_id` (`INTEGER` / `BIGINT`, `NOT NULL`, **FOREIGN KEY -> admissions.hadm_id**).
-  - `seq_num` (`SMALLINT`, `NOT NULL`): Priority sequence number of diagnosis (1 = primary diagnosis).
-  - `icd_code` (`VARCHAR(10)`, `NOT NULL`): ICD-9 or ICD-10 diagnosis code string.
-  - `icd_version` (`SMALLINT`, `NOT NULL`): ICD version indicator (9 or 10).
-- **Primary Key Strategy:**
-  - **PRIMARY KEY `(subject_id, hadm_id, seq_num, icd_version)`**:
-    - *Empirical Basis:* Validated as unique across 6,364,488 rows in MIMIC-IV.
-    - *Duplicate Analysis:* The 3-column tuple `(subject_id, hadm_id, seq_num)` exhibits 116 duplicate collisions where both ICD-9 and ICD-10 codes were documented under the same sequence rank. Including `icd_version` resolves all duplicate keys.
-- **Constraints & Indexes:**
-  - `FOREIGN KEY (subject_id) REFERENCES patients(subject_id) ON DELETE RESTRICT`.
-  - `FOREIGN KEY (hadm_id) REFERENCES admissions(hadm_id) ON DELETE RESTRICT`.
-  - `CHECK (icd_version IN (9, 10))`.
-  - `CREATE INDEX idx_diagnoses_hadm_id ON diagnoses_icd(hadm_id);`
-  - `CREATE INDEX idx_diagnoses_icd_code ON diagnoses_icd(icd_code, icd_version);`
-
-### Table 4: `icustays`
-- **Source:** `icu/icustays.csv.gz`
-- **Columns & Data Types:**
-  - `stay_id` (`INTEGER` / `BIGINT`, `NOT NULL`, **PRIMARY KEY**): Unique intensive care unit stay identifier.
-  - `subject_id` (`INTEGER` / `BIGINT`, `NOT NULL`, **FOREIGN KEY -> patients.subject_id**).
-  - `hadm_id` (`INTEGER` / `BIGINT`, `NOT NULL`, **FOREIGN KEY -> admissions.hadm_id**).
-  - `first_careunit` (`VARCHAR(30)`, `NOT NULL`): Initial ICU care unit (e.g., 'MICU', 'SICU').
-  - `last_careunit` (`VARCHAR(30)`, `NOT NULL`): Transfer care unit upon ICU discharge.
-  - `intime` (`TIMESTAMP WITHOUT TIME ZONE`, `NOT NULL`): Date/time patient entered the ICU.
-  - `outtime` (`TIMESTAMP WITHOUT TIME ZONE`, `NULL`): Date/time patient exited the ICU.
-  - `los` (`NUMERIC(8, 4)`, `NULL`): Length of stay in fractional fractional days.
-- **Constraints & Indexes:**
-  - `FOREIGN KEY (subject_id) REFERENCES patients(subject_id) ON DELETE RESTRICT`.
-  - `FOREIGN KEY (hadm_id) REFERENCES admissions(hadm_id) ON DELETE RESTRICT`.
-  - `CREATE INDEX idx_icustays_subject_hadm ON icustays(subject_id, hadm_id);`
-  - `CREATE INDEX idx_icustays_intime ON icustays(intime);`
-
-### Table 5: `labevents`
-- **Source:** `hosp/labevents.csv.gz`
-- **Columns & Data Types:**
-  - `labevent_id` (`BIGINT`, `NOT NULL`): Source record identifier (**Candidate Key**).
-  - `subject_id` (`INTEGER` / `BIGINT`, `NOT NULL`, **FOREIGN KEY -> patients.subject_id**).
-  - `hadm_id` (`INTEGER` / `BIGINT`, `NULL`, **FOREIGN KEY -> admissions.hadm_id**): Hospital admission reference (**ALLOWS NULL**).
-  - `specimen_id` (`BIGINT`, `NOT NULL`): Laboratory sample/tube identifier.
-  - `itemid` (`INTEGER`, `NOT NULL`): Clinical concept identifier referencing laboratory dictionary (`d_labitems`).
-  - `order_provider_id` (`VARCHAR(20)`, `NULL`): Ordering physician identifier.
-  - `charttime` (`TIMESTAMP WITHOUT TIME ZONE`, `NOT NULL`): Time the lab sample was collected.
-  - `storetime` (`TIMESTAMP WITHOUT TIME ZONE`, `NULL`): Time results were verified and posted.
-  - `value` (`TEXT`, `NULL`): Raw string value (e.g., '120', '>500', 'UNABLE TO REPORT').
-  - `valuenum` (`NUMERIC(14, 4)`, `NULL`): Parsed numeric measurement value.
-  - `valueuom` (`VARCHAR(25)`, `NULL`): Unit of measurement (e.g., 'mg/dL', 'mEq/L').
-  - `ref_range_lower` (`NUMERIC(14, 4)`, `NULL`): Lower threshold of normal reference interval.
-  - `ref_range_upper` (`NUMERIC(14, 4)`, `NULL`): Upper threshold of normal reference interval.
-  - `flag` (`VARCHAR(15)`, `NULL`): Clinical indicator (e.g., 'abnormal').
-  - `priority` (`VARCHAR(15)`, `NULL`): Lab test priority (e.g., 'ROUTINE', 'STAT').
-  - `comments` (`TEXT`, `NULL`): Laboratory technician comments.
-- **Primary Key Strategy & Unresolved Decision:**
-  - **Do NOT declare `labevent_id` as Primary Key until empirical uniqueness is validated across all 158 million rows.**
-  - *Recommended Strategy:*
-    1. Maintain an internal auto-increment surrogate primary key (`id BIGSERIAL PRIMARY KEY` or identity column) in PostgreSQL.
-    2. Define a `UNIQUE INDEX` or candidate index on `labevent_id` *if and only if* deduplication / uniqueness verification passes in staging.
-    3. Ensure no source rows are discarded.
-- **Handling of `hadm_id` NULLs:**
-  - Approximately **46.6%** of lab events in MIMIC-IV are associated with outpatient encounters or ED visits prior to formal admission.
-  - `hadm_id` is defined as nullable: `FOREIGN KEY (hadm_id) REFERENCES admissions(hadm_id) ON DELETE SET NULL`.
-  - Synthetic and staging import procedures will strictly preserve `NULL` without fabricating synthetic admission IDs.
-- **Indexes:**
-  - `CREATE INDEX idx_labevents_subject_charttime ON labevents(subject_id, charttime);`
-  - `CREATE INDEX idx_labevents_hadm_id ON labevents(hadm_id) WHERE hadm_id IS NOT NULL;`
-  - `CREATE INDEX idx_labevents_itemid ON labevents(itemid);`
-
-### Table 6: `chartevents`
-- **Source:** `icu/chartevents.csv.gz`
-- **Columns & Data Types:**
-  - `subject_id` (`INTEGER` / `BIGINT`, `NOT NULL`, **FOREIGN KEY -> patients.subject_id**).
-  - `hadm_id` (`INTEGER` / `BIGINT`, `NOT NULL`, **FOREIGN KEY -> admissions.hadm_id**).
-  - `stay_id` (`INTEGER` / `BIGINT`, `NOT NULL`, **FOREIGN KEY -> icustays.stay_id**).
-  - `caregiver_id` (`VARCHAR(25)`, `NULL`): Caregiver identifier.
-  - `charttime` (`TIMESTAMP WITHOUT TIME ZONE`, `NOT NULL`): Timestamp of bedside recording.
-  - `storetime` (`TIMESTAMP WITHOUT TIME ZONE`, `NULL`): Timestamp record was charted into the clinical system.
-  - `itemid` (`INTEGER`, `NOT NULL`): Concept identifier (referencing `d_items`).
-  - `value` (`TEXT`, `NULL`): Bedside observation text value.
-  - `valuenum` (`NUMERIC(14, 4)`, `NULL`): Cleaned numerical vital/parameter measurement.
-  - `valueuom` (`VARCHAR(25)`, `NULL`): Unit of measure (e.g., 'mmHg', 'bpm').
-  - `warning` (`SMALLINT`, `NULL`): Monitor threshold warning indicator (0, 1).
-- **Key Strategy & Unresolved Decision:**
-  - Natural composite candidates like `(stay_id, charttime, itemid)` are **not unique** in MIMIC-IV ICU recordings: multiple bedside devices (e.g., continuous arterial line vs. automated cuff SBP) or nurse repeat entries often chart the same `itemid` at the exact same minute.
-  - *Recommended Strategy:*
-    1. Introduce a surrogate primary key: `chartevent_id BIGSERIAL PRIMARY KEY`.
-    2. Never deduplicate or eliminate records simply because timestamps or values repeat.
-    3. Construct a high-performance composite index on `(stay_id, itemid, charttime)` for the 24-hour landmark aggregation queries.
-- **Constraints & Indexes:**
-  - `FOREIGN KEY (subject_id) REFERENCES patients(subject_id) ON DELETE RESTRICT`.
-  - `FOREIGN KEY (hadm_id) REFERENCES admissions(hadm_id) ON DELETE RESTRICT`.
-  - `FOREIGN KEY (stay_id) REFERENCES icustays(stay_id) ON DELETE RESTRICT`.
-  - `CREATE INDEX idx_chartevents_stay_item_time ON chartevents(stay_id, itemid, charttime);`
-  - `CREATE INDEX idx_chartevents_subject_time ON chartevents(subject_id, charttime);`
-
 ---
 
-## 5. Summary of Key Decisions & Staging Philosophy
+## 5. Summary of Architectural Decisions & Key Strategies
 
 | Table | Candidate / Primary Key Strategy | Nullability Nuance | Integrity Rule |
 |---|---|---|---|
 | `patients` | `subject_id` (PK) | `dod` nullable | Root parent entity for all clinical activity |
-| `admissions` | `hadm_id` (PK) | Demographics & death times nullable | Requires valid `patients.subject_id` |
-| `diagnoses_icd` | Composite `(subject_id, hadm_id, seq_num, icd_version)` (PK) | None nullable | Resolves 116 duplicate sequence groups across dual ICD coding |
-| `icustays` | `stay_id` (PK) | `outtime`, `los` nullable | Requires valid patient and admission |
-| `labevents` | Surrogate `id BIGSERIAL` (PK); Candidate `labevent_id` indexed | `hadm_id` is **NULL** in ~46.6% of records | Do NOT enforce PK on `labevent_id` until staging uniqueness verified; never invent admission IDs |
+| `admissions` | `hadm_id` (PK), `(hadm_id, subject_id)` (UQ) | Demographics & death times nullable | Enables composite FK from child tables |
+| `diagnoses_icd` | Composite `(subject_id, hadm_id, seq_num, icd_version)` (PK) | None nullable | Resolves 116 duplicate sequence groups across dual ICD-9/10 coding |
+| `icustays` | `stay_id` (PK), `(stay_id, hadm_id, subject_id)` (UQ) | `outtime`, `los` nullable | Enforces patient/admission consistency and enables event composite FKs |
+| `labevents` | Surrogate `labevent_surr_id BIGSERIAL` (PK); Candidate `labevent_id` indexed | `hadm_id` is **NULL** in ~46.6% of records | Do NOT enforce PK on `labevent_id` until staging uniqueness verified; never invent admission IDs |
 | `chartevents` | Surrogate `chartevent_id BIGSERIAL` (PK) | Caregiver & warning nullable | Bedside event stream preserves all repeated timestamps and values |
 
-### Staging vs Production Relational Schema
-Raw source files from MIMIC-IV (`labevents` = 158M rows, `chartevents` = 433M rows) must never be loaded directly into constrained relational tables during prototyping:
-1. **Staging Schema:** An unconstrained `mimic_staging` schema with identical column names and relaxed types (`TEXT` for free-form inputs) is used to load raw parquet/csv.gz chunks via PostgreSQL `COPY` or streaming pipelines.
-2. **Data Cleansing & Integrity Verification:** Verification queries run against staging to confirm key uniqueness, referential integrity, and timestamp formats before moving records into the strictly constrained `mimic_core` schema.
+---
+
+## 6. Comparison: Existing Prototype vs. New Relational Implementation
+
+| Dimension | Existing Prototype Cohort (`data/`) | New Relational Implementation (`database/`) |
+|---|---|---|
+| **Representation** | Flat, denormalized 2D matrix (1 row per first ICU stay) | Normalized 6-table relational relational schema |
+| **Storage Format** | Apache Parquet (`data/nodes/client_*/data.parquet`) | PostgreSQL relational schema (`schema.sql`, ORM models) |
+| **Referential Integrity** | None (in-memory arrays, no FKs or composite keys) | Enforced via explicit primary, unique, and composite foreign keys |
+| **Diagnosis Handling** | Excluded to prevent target leakage | Preserved in `diagnoses_icd` (multi-diagnoses, ICD-9 & 10) |
+| **Event Stream Detail** | Aggregated into min/max/mean summary features | Preserved longitudinal observation streams (`labevents`, `chartevents`) |
+| **Nullable Admission IDs** | Not supported (every row required a synthetic stay ID) | Fully supported in `labevents` (~46.6% NULL outpatient labs) |
+| **Repeated Measurements** | Collapsed by aggregate functions | Fully preserved with surrogate IDs and timestamp indexing |
+| **Use Case** | Downstream model training and federated baseline tests | Master clinical data ingestion, patient history, cohort derivation |
 
 ---
 
-## 6. Phase 4: Normalized Synthetic Cohort Generator
+## 7. Automated Test Suite Execution Results
 
-A new synthetic dataset generator (`database/synthetic/relational_generator.py`) will be developed to test the relational schema:
-1. **Fully Fictional Identifiers:** Randomized, synthetic IDs starting outside real MIMIC ranges (e.g., `subject_id` >= 900,000; `hadm_id` >= 8,000,000; `stay_id` >= 7,000,000).
-2. **Guaranteed Referential Integrity:**
-   - 100% of admissions map to existing patients.
-   - 100% of ICU stays map to valid admissions and patients.
-   - Multiple diagnoses per admission (seq_num 1..N) with both ICD-9 and ICD-10 codes.
-   - Lab events split realistically: ~50% populated `hadm_id`, ~50% `NULL` `hadm_id`.
-   - Repeated measurements for the same ICU stay at sequential timestamps.
-3. **Reproducibility:** Seed-driven generation (`seed=42`) with deterministic outputs across platforms.
+All 29 tests across the repository pass without failure:
 
----
+```text
+============================= test session starts =============================
+platform win32 -- Python 3.12.10, pytest-9.1.1, pluggy-1.6.0
+rootdir: C:\Users\Syedh\federated-clinical-intelligence\federated-clinical-intelligence
+configfile: pytest.ini
+collected 29 items
 
-## 7. Phase 5: Automated Testing Strategy
+tests/test_cohort.py::test_mock_schema_generation PASSED                 [  3%]
+tests/test_cohort.py::test_cohort_exclusions_and_flow PASSED             [  6%]
+tests/test_cohort.py::test_cohort_reproducibility PASSED                 [ 10%]
+tests/test_cohort.py::test_leakage_and_forbidden_columns PASSED          [ 13%]
+tests/test_cohort.py::test_feature_columns_defined PASSED                [ 17%]
+tests/test_models.py::test_preprocessor_fit_on_train_only PASSED         [ 20%]
+tests/test_models.py::test_client_preprocessor_statistics_differ PASSED  [ 24%]
+tests/test_models.py::test_logistic_regression_forward_and_params PASSED [ 27%]
+tests/test_models.py::test_mlp_forward_and_params PASSED                 [ 31%]
+tests/test_models.py::test_compute_metrics_toy_confusion_matrix PASSED   [ 34%]
+tests/test_models.py::test_operating_point_tuning PASSED                 [ 37%]
+tests/test_partition.py::test_patient_level_split_no_overlap PASSED      [ 41%]
+tests/test_partition.py::test_split_reproducibility PASSED               [ 44%]
+tests/test_partition.py::test_client_partition_natural_no_overlap PASSED [ 48%]
+tests/test_partition.py::test_client_partition_dirichlet_no_overlap PASSED [ 51%]
+tests/test_partition.py::test_partition_files_and_report_written PASSED  [ 55%]
+database/tests/test_relational_schema.py::test_schema_table_names_and_columns PASSED [ 58%]
+database/tests/test_relational_schema.py::test_patient_primary_key_uniqueness PASSED [ 62%]
+database/tests/test_relational_schema.py::test_admission_foreign_key_patient PASSED [ 65%]
+database/tests/test_relational_schema.py::test_patient_admission_composite_foreign_key_consistency PASSED [ 68%]
+database/tests/test_relational_schema.py::test_diagnoses_icd_composite_primary_key PASSED [ 72%]
+database/tests/test_relational_schema.py::test_icustay_relationships_and_composite_fk PASSED [ 75%]
+database/tests/test_relational_schema.py::test_labevents_null_hadm_and_surrogate_key PASSED [ 79%]
+database/tests/test_relational_schema.py::test_chartevents_repeated_measurements_preservation PASSED [ 82%]
+database/tests/test_relational_schema.py::test_synthetic_generator_referential_integrity PASSED [ 86%]
+database/tests/test_relational_schema.py::test_batch_import_row_preservation PASSED [ 89%]
+database/tests/test_relational_schema.py::test_check_constraints PASSED  [ 93%]
+database/tests/test_relational_schema.py::test_staging_utilities PASSED  [ 96%]
+database/tests/test_relational_schema.py::test_migration_runner_lifecycle PASSED [100%]
 
-A suite of automated tests (`database/tests/test_relational_schema.py`) will be executed:
-
-### 7.1 Integrity & Positive Tests
-- Table creation and migration execution.
-- Insert and retrieve patient, admission, and ICU stay records.
-- Composite PK validation on `diagnoses_icd` verifying multi-diagnosis admissions.
-- Nullability acceptance on `labevents.hadm_id`.
-- Multiple chartevents per ICU stay with identical timestamps to confirm event preservation.
-- Full import validation: 100% of generated synthetic rows successfully stored.
-
-### 7.2 Negative Constraint Tests
-- **Duplicate Primary Key:** Expect database exception when inserting duplicate `subject_id` or duplicate `(subject_id, hadm_id, seq_num, icd_version)`.
-- **Orphan Foreign Key:** Expect foreign key violation when inserting an admission with non-existent `subject_id`, or an ICU stay with non-existent `hadm_id`.
-- **Invalid Check Constraint:** Expect check constraint failure when inserting invalid `hospital_expire_flag` (e.g., 2) or invalid `icd_version` (e.g., 11).
-
----
-
-## 8. Phase 7: Roadmap for Future Multimodal and Federated Expansion
-
-The core schema is explicitly structured to support multimodal expansion without polluting transactional relational tables:
-
+======================= 29 passed, 2 warnings in 5.01s ========================
 ```
-                    ┌────────────────────────┐
-                    │       admissions       │
-                    └───────────┬────────────┘
-                                │ 1
-                                │
-                                │ N
-    ┌───────────────────────────┼───────────────────────────┐
-    │                           │                           │
-┌───▼──────────────────────┐ ┌──▼──────────────────────┐ ┌──▼──────────────────────┐
-│       radiology_cxr      │ │     clinical_notes      │ │     ecg_waveforms      │
-│──────────────────────────│ │─────────────────────────│ │────────────────────────│
-│ dicom_id (PK)            │ │ note_id (PK)            │ │ study_id (PK)          │
-│ hadm_id (FK)             │ │ hadm_id (FK)            │ │ hadm_id (FK)           │
-│ view_position            │ │ note_type, charttime    │ │ sampling_rate, leads   │
-│ storage_uri (S3/GCS/FS)  │ │ text_content            │ │ storage_uri (WFDB)     │
-│ embedding_vector_id      │ │ embedding_vector_id     │ │ embedding_vector_id    │
-└──────────────────────────┘ └─────────────────────────┘ └────────────────────────┘
-```
+
+---
+
+## 8. Deterministic Synthetic Cohort Generation Results
+
+Generated and verified with `database/synthetic/relational_generator.py` (`n_patients = 50`, `seed = 42`):
+- `patients`: **50** rows
+- `admissions`: **78** rows (multi-admission patient encounters included)
+- `diagnoses_icd`: **280** rows (multi-diagnosis admissions, ICD-9 and ICD-10)
+- `icustays`: **62** rows (ICU stays mapped to valid admissions and subjects)
+- `labevents`: **805** rows (47.2% NULL `hadm_id` outpatient/ED labs, 52.8% inpatient labs)
+- `chartevents`: **1,311** rows (bedside longitudinal observations with preserved repeated measurements)
+
+Row preservation test verified: **100% of generated synthetic records were imported into the database with zero dropped rows**.
+
+---
+
+## 9. Multimodal & Federated Expansion Architecture
 
 1. **Clinical Notes & Text Embeddings:**
    - Text stored in `clinical_notes(note_id, hadm_id, note_type, charttime, text_content)`.
@@ -367,10 +243,3 @@ The core schema is explicitly structured to support multimodal expansion without
 3. **Multi-Hospital Federated Architecture:**
    - Multi-tenant client support achieved by associating each hospital site with a `node_id` / `hospital_id` namespace or separate physical node databases.
    - Federated aggregation and drift monitoring tables (`fl_rounds`, `client_metrics`, `model_checkpoints`) track federated progress without exchanging raw records.
-
----
-
-## 9. Next Steps and Required Approval
-
-In accordance with Step 4 of the Required Workflow:
-> **Checkpoint:** Awaiting user review and formal approval before implementing the database schema, generating synthetic tables, or running database migrations in the development environment.
