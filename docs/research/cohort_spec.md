@@ -1,7 +1,7 @@
 # Cohort Specification: 24-Hour Landmark First ICU Stay Mortality
 
 **Dataset:** MIMIC-IV v3.1 (PhysioNet credentialed access)  
-**Creation Date:** 2026-10-20  
+**Creation Date:** 2026-10-30  
 **Task:** In-hospital mortality prediction at 24 hours post-ICU admission.  
 
 ---
