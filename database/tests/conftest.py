@@ -21,12 +21,13 @@ from database.synthetic.relational_generator import generate_synthetic_relationa
 @event.listens_for(Engine, "connect")
 def enable_sqlite_foreign_keys(dbapi_connection, connection_record):
     """Enforces strict foreign key validation on SQLite in-memory connections."""
-    try:
-        cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
-    except Exception:
-        pass
+    if dbapi_connection.__class__.__module__.startswith("sqlite3"):
+        try:
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.close()
+        except Exception:
+            pass
 
 
 @pytest.fixture(scope="session")
@@ -78,3 +79,4 @@ def db_session(db_engine) -> Session:
 def synthetic_cohort():
     """Generates a fixed synthetic relational cohort for tests."""
     return generate_synthetic_relational_cohort(n_patients=25, seed=42)
+
