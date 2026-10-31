@@ -1,100 +1,63 @@
-# Person B — Multimodal Modeling
-## Implementation Plan (follow 00_SHARED_REPO_PROTOCOL.md for every phase)
+# Person B (Syed) — Cohort, Splitting, Tabular Models & Clinical Evaluation
+## Implementation Plan (Follow `00_SHARED_REPO_PROTOCOL.md`)
 
-Folders owned: `models/`, `data/preprocessing.py`, `data/partition.py`, `data/mock_schema.py`, `tests/test_models.py`, `tests/test_preprocessing.py`, `tests/test_partition.py`.
+**Owned Folders & Files:** `models/`, `data/cohort.py`, `data/split.py`, `data/partition.py`, `data/mock_schema.py`, `eval/clinical_metrics.py`, `eval/calibration.py`, `tests/test_cohort.py`, `tests/test_split.py`, `tests/test_partition.py`, `tests/test_models.py`.
 
-**You are the only team member with PhysioNet-credentialed MIMIC-IV access.** Real patient data lives only on your machine, is never committed to git (`.gitignore` enforces this), and is never shared with Ishthiyaq or Kiran directly. They build and test against `data/mock_schema.py`, a synthetic dataset you generate matching MIMIC-IV's exact schema. Kick off PhysioNet CITI training + data use agreement in Week 0, in parallel with everything else — it's the longest lead-time item in the project.
+**Data Governance:** Sole team member with PhysioNet-credentialed MIMIC-IV access. Real patient data lives strictly on your local machine and is never committed to Git. Collaborators (Ishthiyaq and Kiran) build and test exclusively against `data/mock_schema.py`.
 
----
-
-### PHASE 1 — Contract Confirmation + Scaffolding
-
-**Deliverable (exact):**
-- Read Person A's `models/model_interface.py` stub (pull `main` after their Phase 1 merges). Confirm your model will implement standard `nn.Module` with `.state_dict()`/`.load_state_dict()`.
-- `models/tabular.py`, `models/text.py`, `models/fusion.py` created as empty class stubs: `class TabularEncoder(nn.Module)`, `class TextEncoder(nn.Module)`, `class FusionModel(nn.Module)` — just `__init__` and `forward` signatures, no logic yet
-- Decision recorded as a comment at top of `models/text.py`: frozen ClinicalBERT vs lightweight BiLSTM/TF-IDF, with one sentence why
-- `data/mock_schema.py` with `generate_mock_data(n_patients: int = 2000) -> pd.DataFrame`: produces synthetic data matching MIMIC-IV's exact column names/dtypes (tabular vitals/labs + a synthetic free-text note column), so Ishthiyaq and Kiran can build against it immediately without PhysioNet access
-- `data/partition.py` with `partition_data(df, num_nodes, strategy="dirichlet", alpha=0.5, seed=42) -> dict[int, pd.DataFrame]`, writing to `data/nodes/node_{i}/data.parquet` — run this against `data/mock_schema.py` output for teammates, and separately against real MIMIC-IV locally once your PhysioNet access clears (real output never committed)
-
-**Test command:** `pytest tests/test_models.py::test_imports -v`
-**Test must confirm:** all three classes instantiate with dummy args and `forward()` on random tensors returns a tensor of the expected shape (declare expected shape as a docstring in each class).
-
-**Human checkpoint:** pull Person A's merged `config/base.yaml` and `client/client_app.py` yourself, read the `fit()`/`evaluate()` signature, and mentally trace how your model's `state_dict()` will flow through it. If it doesn't fit, comment on their PR/Slack now, not later.
+> **Baseline Status:** Baseline code (`data/cohort.py`, `data/split.py`, `data/partition.py`, `data/mock_schema.py`, `models/`, and tests) has been drafted. Non-torch unit tests were verified in an isolated test environment. PyTorch model training code, the centralized runner, and `tests/test_models.py` have been drafted but are **NOT yet verified** against an active PyTorch run in this repository. Do not state any test as passing unless you read a passing run in this repo.
 
 ---
 
-### PHASE 2 — Preprocessing Pipeline
-
-**Deliverable (exact):**
-- `data/preprocessing.py` with `def preprocess_tabular(df: pd.DataFrame, fit_stats: dict = None) -> (pd.DataFrame, dict)` — returns cleaned df + the fit stats (mean/std/mode used), so stats can be computed per-node, not globally
-- `def preprocess_text(notes: list[str]) -> list[str]` — cleaning/normalization only, no tokenization yet
-- Must run once per `data/nodes/node_{i}/data.parquet` (Person A's Phase 2 output) — write `data/nodes/node_{i}/data_clean.parquet` for each node
-
-**Test command:** `pytest tests/test_preprocessing.py -v`
-**Tests must confirm (exact assertions):**
-1. `assert df_clean.isnull().sum().sum() == 0`
-2. run `preprocess_tabular` independently on node 0 and node 1 data, `assert fit_stats["node0"] != fit_stats["node1"]` (proves no global leakage)
-3. text cleaning removes non-printable characters and strips leading/trailing whitespace on a sample with injected noise
-
-**Fix loop:** if assertion 2 fails (stats identical across nodes), you have a global-leakage bug — do not proceed until fixed.
-
-**Human checkpoint:** print 5 raw vs cleaned records (mixed tabular+text) and read them yourself before merging.
+### STAGE 0 — Literature Closure & Cohort Specifications
+- **Deliverable:**
+  1. Lead Stage 0 literature review check across FLamby, FedDrift, and clinical prediction literature (`docs/research/decision_log.md` D13).
+  2. Document cohort inclusion/exclusion criteria: adult patients, first ICU stay per subject, 24h landmark window after ICU admission, binary target `hospital_expire_flag`.
+  3. Ensure `data/mock_schema.py` accurately mirrors MIMIC-IV tabular feature names and types.
+- **Test Command:** `pytest tests/test_cohort.py::test_mock_schema_generation -v`
+- **Fix Loop:** If column names diverge from MIMIC-IV v3.1 schemas, correct `data/mock_schema.py` before teammates pull.
 
 ---
 
-### PHASE 3 — Tabular Branch
-
-**Deliverable (exact):**
-- `models/tabular.py`: `class TabularEncoder(nn.Module)` — MLP, `__init__(self, input_dim, hidden_dims=[64,32], output_dim=16, mode="embedding")` where `mode` is `"embedding"` (returns 16-dim vector) or `"logit"` (returns 1 sigmoid logit)
-- `models/train_centralized_tabular.py` — standalone script: loads all nodes' cleaned data combined, trains `TabularEncoder(mode="logit")` centrally, reports accuracy/precision/recall/F1, saves to `models/baselines/tabular_centralized_metrics.json`
-
-**Test command:** `pytest tests/test_models.py::test_tabular -v`
-**Tests must confirm:** forward pass shape correct in both modes; 5-epoch training run on synthetic data produces non-NaN loss that decreases; save/load round-trip produces identical predictions on a fixed input.
-
-**Human checkpoint:** open `models/baselines/tabular_centralized_metrics.json`, sanity-check the accuracy number is plausible (not 50% = random, not 100% = leakage) before treating it as your baseline reference.
-
----
-
-### PHASE 4 — Text Branch
-
-**Deliverable (exact):**
-- `models/text.py`: `class TextEncoder(nn.Module)` — if frozen ClinicalBERT: wraps `AutoModel.from_pretrained("emilyalsentzer/Bio_ClinicalBERT")`, frozen weights, `forward(input_ids, attention_mask) -> 768-dim pooled embedding`, plus `models/embedding_cache.py` with `def get_or_compute_embedding(note_id, text) -> np.ndarray` caching to `data/nodes/node_{i}/text_embeddings.npz`
-- If lightweight fallback: TF-IDF (max_features=5000) + 2-layer MLP down to 64-dim
-
-**Test command:** `pytest tests/test_models.py::test_text -v`
-**Tests must confirm:** embedding output shape/dtype correct; calling `get_or_compute_embedding` twice on the same note_id returns identical arrays (cache hit, not recompute); a cosine-similarity script comparing 3 similar-topic notes vs 3 unrelated notes shows similar-pair average similarity > unrelated-pair average similarity.
-
-**Fix loop:** if the cosine-similarity sanity check fails (similar notes aren't more similar than unrelated ones), check tokenizer/model mismatch before proceeding — this is a silent-bug pattern.
-
-**Human checkpoint:** personally read the 3 similar / 3 unrelated note pairs and their similarity scores before merging.
+### STAGE 1 — Cohort Extraction, Leakage Checks & Patient Splitting
+- **Deliverable:**
+  1. `data/cohort.py`: Extracts 24h aggregate features (min, max, mean) for vitals and laboratory values. Excludes post-landmark observations, discharge-time variables, or outcome proxies.
+  2. Automated leakage tests in `tests/test_cohort.py::test_leakage_and_forbidden_columns`: asserts no forbidden columns or post-landmark timestamps exist.
+  3. `data/split.py`: Performs patient/subject-level train/validation/test split strictly by `subject_id` before partitioning.
+  4. `data/partition.py`: Natural partitioning by `first_careunit` across 5 simulated client partitions (train split only; global validation and test splits).
+- **Test Command:** `pytest tests/test_cohort.py tests/test_split.py tests/test_partition.py -v`
+- **Tests Must Confirm:**
+  - `assert len(set(train_subjects) & set(test_subjects)) == 0` (zero subject leakage across splits).
+  - Every client partition in train has valid clinical features and non-zero positive mortality cases.
 
 ---
 
-### PHASE 5 — Fusion + Joint Integration (JOINT with Person A)
-
-**Deliverable (exact):**
-- `models/fusion.py`: `class FusionModel(nn.Module)` — `__init__(self, tabular_dim=16, text_dim=64_or_768, hidden_dim=32)`, concatenates `TabularEncoder(mode="embedding")` output + `TextEncoder` output, MLP head to 1 sigmoid logit
-- `models/train_centralized_ablation.py` — trains and reports tabular-only, text-only, fusion, saves `models/baselines/ablation_results.json`
-- Coordinate live with Person A: your `FusionModel` gets imported into their `server/run_simulation.py` in this same phase
-
-**Test command:** `pytest tests/test_models.py::test_fusion -v` AND (jointly) Person A's `test_real_model_round`
-**Test must confirm:** fusion forward pass shape correct; ablation script runs all 3 configs without error and produces a results table with 3 non-degenerate accuracy numbers.
-
-**Fix loop:** any interface error when Person A wires in your model — fix on your side to match the Phase 1 contract exactly, don't ask them to work around your model's quirks.
-
-**Human checkpoint (joint):** watch one real federated round complete with your fusion model live with Person A before either of you merges. Separately, review the ablation table — if fusion underperforms tabular-only, note this honestly rather than adjusting hyperparameters until it "looks right."
+### STAGE 2 — Tabular Model Implementations & Centralized Reference
+- **Deliverable:**
+  1. `models/tabular.py`:
+     - Model A: Scikit-learn Logistic Regression baseline.
+     - Model B: PyTorch small Multilayer Perceptron (2 hidden layers, e.g. 64 -> 32 -> 1 logit).
+  2. `models/train_centralized.py`: Centralized reference training harness matching federated architectures, hyperparameters, and preprocessing exactly.
+  3. `eval/clinical_metrics.py`: Computes AUROC, AUPRC, F1, sensitivity, specificity, Brier score.
+  4. `eval/calibration.py`: Computes ECE and reliability diagrams.
+- **Test Command:** `pytest tests/test_models.py tests/test_eval.py -v`
+- **Fix Loop:** Verify model forward passes return correct shapes. Verify centralized reference trains stably on synthetic/mock data before running on real data.
 
 ---
 
-### PHASE 6 — Robustness, Docs, Final Checkpoint
+### STAGE 3 — Pilot & Freeze Gate (Mandatory)
+- **Deliverable:**
+  1. Lead statistical protocol decision (`decision_log.md` D8): confirm event-level detection F1 as primary outcome, clinical AUROC supporting.
+  2. Evaluate centralized reference on validation splits to establish non-private target utility.
+  3. Formulate directional hypotheses and null-result interpretation protocol (`decision_log.md` D10).
+  4. Freeze cohort, feature list, and split seeds before final experimental sweeps.
+- **Human Checkpoint:** Joint sign-off with Ishthiyaq and Kiran freezing `docs/research/PROTOCOL.md`.
 
-**Deliverable (exact):**
-- `models/train_centralized_ablation.py` extended: re-run ablation with Person A's DP wrapper on/off (import from `privacy/dp_wrapper.py`), append to `ablation_results.json`
-- `models/inference.py`: `def predict(tabular_input: dict, note_text: str, checkpoint_path: str) -> dict` returning `{"prediction": float, "confidence": float, "top_features": list, "top_tokens": list}` (simple SHAP for tabular, attention-weight-based for text)
-- `models/README.md`: architecture, ablation table, checkpoint loading instructions
-- Export final best checkpoint to `models/checkpoints/final_fusion_model.pt`
+---
 
-**Test command:** `pytest tests/test_models.py -v` (full file)
-**Tests must confirm:** `inference.py`'s `predict()` runs end-to-end on 5 hardcoded example inputs without error and returns correctly-typed output dict for each.
-
-**Human checkpoint:** personally run the 5 example predictions and read the outputs — confirm they're sane (e.g. clearly-severe example predicts high risk) before handing `final_fusion_model.pt` to Person C for the dashboard.
+### STAGE 4 — Statistical Evaluation & Paper Section
+- **Deliverable:**
+  1. Execute paired comparisons on matched seeds (`eval/statistical_comparison.py`) using Wilcoxon signed-rank tests and 95% confidence intervals.
+  2. Populate Table I, Table II, and Section V.B in `docs/research/PAPER_DRAFT.md` reading directly from `results/registry.jsonl`.
+  3. Ensure no manual metric overrides or cherry-picking.
+- **Test Command:** `pytest tests/ -v` (all tests pass cleanly).

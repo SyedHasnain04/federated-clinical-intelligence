@@ -1,44 +1,49 @@
 # IMPLEMENTATION_PLAN.md
 
-Top-level index. This file does not duplicate the detailed phase-by-phase instructions — those live in the per-role documents. This file exists so anyone landing in the repo can see the whole build at a glance and find the right document.
+Master index and timeline for *Privacy-Aware Drift Detection in Federated Clinical Learning: Evaluating the Effect of Differential Privacy on Detection Reliability and Clinical Prediction*.
 
-## Timeline
-8 weeks for the working system (Phases 1-6), optional 2-4 more weeks for research rigor (Phase 7+). See the week-by-week table below.
+`docs/research/PROTOCOL.md` is the single source of truth. Numeric parameters retain status "PROPOSED" until the protocol is frozen. All open decisions reside in `docs/research/decision_log.md`.
 
-| Week | Phase | Ishthiyaq (Person A) | Syed (Person B) | Kiran (Person C) |
-|---|---|---|---|---|
-| 1 | 1 | Contract + config + skeleton | Contract confirmation + scaffolding | CI + mocked metrics schema |
-| 2 | 2 | Non-IID data partitioning | Preprocessing pipeline | Docker/Compose multi-node setup |
-| 3 | 3 | Full federated round, end to end | Tabular branch + centralized baseline | Real logging integration |
-| 4 | 4 | Differential privacy | Text branch | Drift detection + trigger (core deliverable) |
-| 5 | 5 (joint) | Robustness + real model integration | Fusion + joint integration | (drift work continues into wk5) |
-| 6 | — | Buffer / catch-up (integration risk) | Buffer / catch-up | Buffer / catch-up |
-| 7 | 6 | Final hardening | Robustness, docs, final checkpoint | Dashboard: all 5 panels |
-| 8 | 6 (cont.) | Fresh-clone verification | Fresh-clone verification | CI/CD, final testing, demo rehearsal |
-| 9-12 (optional) | 7+ | Federated/privacy rigor (RQ-driven ablations) | Multimodal ablations, calibration | Drift rigor, reproducibility, final quality gate |
+---
 
-## Where to find the actual instructions
-| Document | Contains |
+## Baseline Status Note
+> **Baseline Status:** Baseline code (`data/cohort.py`, `data/split.py`, `data/partition.py`, `data/mock_schema.py`, `models/`, and tests) has been drafted. Non-torch unit tests were verified in an isolated test environment. PyTorch model training code, the centralized runner, and `tests/test_models.py` have been drafted but are **NOT yet verified** against an active PyTorch run in this repository. Do not report or treat any test as passing unless you observe a verified passing test command output in this repository.
+
+---
+
+## Timeline (8–10 Weeks)
+
+| Week | Stage | Syed (Person B) | Ishthiyaq (Person A) | Kiran (Person C) | Gate / Milestone |
+|---|---|---|---|---|---|
+| **1** | Stage 0 & Setup | Stage 0 Literature Closure lead; cohort schema & leakage test setup | Literature Closure review; Flower FL environment setup | Literature Closure review; drift scenario schema | Literature review closed; no unsupported novelty claims |
+| **2** | Stage 1 | 24h landmark cohort extraction, leakage tests | Flower non-private FedAvg baseline skeleton | Synthetic scenario generator (abrupt, gradual) | Leakage tests pass; synthetic scenarios versioned |
+| **3** | Stage 1 | Patient-level train/val/test split, natural client partition | End-to-end FedAvg loop with mock data | Page-Hinkley detector implementation on log-loss | Non-overlapping patient split verified |
+| **4** | Stage 1 | Tabular models (Logistic Regression, 2-layer MLP) | Record-level DP-SGD (Opacus) integration | Deterministic rule-based recovery controller | Baseline centralized reference verified |
+| **5** | Stage 2 | Clinical metrics & calibration (`eval/`) | Privacy accountant (RDP/PRV) + cross-check | Validation calibration of detector thresholds | **PILOT & FREEZE GATE**: DP feasibility, stable false alarms <= 5% verified |
+| **6** | Stage 3 | Multi-seed execution, clinical AUROC / AUPRC | DP sweep ($\varepsilon \in \{1, 3, 8\}$), privacy ledger | Crossed DP x Drift grid execution | Primary outcome runs logged to registry |
+| **7** | Stage 3 | Statistical testing (Wilcoxon paired, 95% CIs) | Communication cost & false-alarm overhead | Recovery experiments & timeline evaluation | Complete crossed grid in `results/registry.jsonl` |
+| **8** | Stage 4 | Paper draft (Methods, Setup, Results tables) | Paper draft (Privacy accounting, Cost analysis) | Paper draft (Drift scenarios, Detection F1), Optional viewer | Complete draft with bracketed placeholders filled from registry |
+| **9–10** | Stage 4 | Final paper polishing, peer review checks | Final audit of privacy ledger & costs | Final skeptical review & reproducibility run | Final submission-ready IEEE short paper (4-6 pages) |
+
+---
+
+## Stage Gating Rules
+1. **Stage 0 Gate**: Literature closure must complete before writing any novelty claims in the draft.
+2. **Pilot and Freeze Gate (Week 5)**: Before final experimental sweeps, all hyperparameters, scenario definitions, seed counts (at least 5; 10 preferred), and the single primary outcome must be validated on validation data and frozen. No tuning on test data.
+3. **Execution Gate**: Every result reported in documentation must come directly from automated test runs logged immutably to `results/registry.jsonl`.
+
+---
+
+## Documentation Index
+| Document | Contents |
 |---|---|
-| `00_SHARED_REPO_PROTOCOL.md` | Git workflow, folder ownership, error-rectification rule — read first, always |
-| `PersonA_Implementation_Plan.md` + `PersonA_Prompt_Guide.md` | Ishthiyaq's exact phase-by-phase deliverables, test commands, and ready-to-use agent prompts |
-| `PersonB_Implementation_Plan.md` + `PersonB_Prompt_Guide.md` | Syed's exact phase-by-phase deliverables, test commands, and ready-to-use agent prompts |
-| `PersonC_Implementation_Plan.md` + `PersonC_Prompt_Guide.md` | Kiran's exact phase-by-phase deliverables, test commands, and ready-to-use agent prompts |
-| `RESEARCH_PROTOCOL.md` + `EVAL_MODULE_SPEC.md` | Phase 7+ research rigor, mapped to the same three roles |
-| `TECH_ARCHITECTURE.md` | System diagram, module boundaries, data flow guarantees |
-| `UI_UX_SPEC.md` + `DESIGN_SYSTEM.md` | Dashboard panel spec and visual tokens (Kiran's Phase 5) |
-| `AI_EXPERIENCE_SPEC.md` | Rules for how predictions/drift claims are presented honestly |
-| `QUALITY_BAR.md` | Definition of done, per phase and overall |
-
-## Gating rules
-- Phase N does not start for any person until their own Phase N-1 is merged.
-- Phase 5 (all three roles) has explicit joint checkpoints — do not attempt solo.
-- Phase 7+ does not start until Phase 6 is merged for all three people AND a fresh-clone dry run of the full system passes.
-- `main` is protected — every phase's output goes through a PR and (once teammates are active) a review approval before merge.
-
-## Definition of complete (top level — see `QUALITY_BAR.md` for full detail)
-1. All three people's Phase 6 work is merged.
-2. `docker-compose up` on a fresh clone brings up the full simulation with zero manual fixes.
-3. The dashboard's Inject Drift button demonstrably triggers detect → retrain → recover, live.
-4. The README runbook can be followed by someone unfamiliar with the code to reproduce the entire demo.
-5. (If Phase 7+ completed) every claim in the final report traces to a real logged `ExperimentResult`.
+| `docs/research/PROTOCOL.md` | Single source of truth: research question, parameters, baselines, and scope |
+| `docs/research/decision_log.md` | Register of open decisions (D1–D14) |
+| `00_SHARED_REPO_PROTOCOL.md` | Git workflow, folder ownership, PR approval rules |
+| `PersonA_Implementation_Plan.md` + `PersonA_Prompt_Guide.md` | Ishthiyaq: FL infrastructure, DP-SGD, privacy accountant, ledger, communication cost |
+| `PersonB_Implementation_Plan.md` + `PersonB_Prompt_Guide.md` | Syed: Cohort extraction, leakage checks, patient splitting, partitioning, tabular models, clinical metrics |
+| `PersonC_Implementation_Plan.md` + `PersonC_Prompt_Guide.md` | Kiran: Drift scenarios, Page-Hinkley detector, recovery controller, optional viewer, results registry |
+| `EVAL_MODULE_SPEC.md` | Standardized evaluation module specification (`eval/`) |
+| `RESULTS_STORAGE_SPEC.md` | Immutable registry logging requirements |
+| `docs/research/PAPER_DRAFT.md` | 4–6 page IEEE paper scaffold |
+| `QUALITY_BAR.md` | Verification checklist and claim-to-evidence mapping |
