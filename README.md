@@ -1,76 +1,72 @@
-# Federated Clinical Intelligence Platform
+# Privacy-Aware Drift Detection in Federated Clinical Learning: Evaluating the Effect of Differential Privacy on Detection Reliability and Clinical Prediction
 
-A self-evolving, privacy-preserving, multimodal clinical intelligence system. Simulated hospital nodes collaboratively train a shared severity/mortality prediction model on MIMIC-IV COVID-19 data — combining structured EHR data and clinical notes — without any node's raw patient data ever leaving that node, and with automated drift detection that triggers self-recovery through retraining.
+A controlled empirical evaluation characterizing the interaction between record-level differential privacy (DP-SGD) strength and runtime drift-detection reliability in federated clinical machine learning. Using structured electronic health record (EHR) data from MIMIC-IV v3.1 across simulated client partitions, the study evaluates how gradient perturbation noise alters the sensitivity, false-alarm rate, detection delay, and recovery behavior of Page-Hinkley error detectors under stable, abrupt, gradual, localized, global, and natural-temporal distribution shifts.
 
-Final-year capstone project — G. Pulla Reddy Engineering College, CSE (ML).
+**Project Status:** Active research implementation — **protocol not yet frozen** (candidate parameters retain status PROPOSED until validated).
 
-## Team
-| Role | Person | Owns |
+---
+
+## Scope Boundary
+
+| Category | In Scope | Out of Scope (Future Work) |
 |---|---|---|
-| Federated Infrastructure & Privacy | Ishthiyaq | `server/`, `client/`, `privacy/` — builds/tests against synthetic mock data |
-| Multimodal Modeling & Dataset | Syed Hasnain | `models/`, `data/` (preprocessing, partitioning, mock schema) — **sole holder of real MIMIC-IV access** |
-| Self-Evolving Loop, MLOps & Product | Kiran | `monitoring/`, `dashboard/`, `infra/`, CI/CD — builds/tests against synthetic mock data |
+| **Data Modality** | Structured EHR (MIMIC-IV v3.1; adult 24h ICU landmark) | Free-text clinical notes, NLP, MIMIC-CXR chest X-rays |
+| **Prediction Target** | Binary in-hospital mortality (`hospital_expire_flag`) | Multi-task prediction, continuous hospital length of stay |
+| **Federated Infrastructure** | Flower FedAvg across 5 simulated client partitions | Real multi-institution or physical network deployment |
+| **Privacy Mechanism** | Record-level DP-SGD (Opacus), $\varepsilon \in \{1, 3, 8\}$, $\delta = 10^{-5}$ | Patient-level DP (unless cohort strictly guarantees 1 record/subject) |
+| **Drift Detection** | Page-Hinkley on client mean prediction log-loss windows | Unsupervised drift detection, embedding drift detectors |
+| **Adaptation Controller** | Deterministic rule-based controller (no-op, local, global) | Autonomous AI agents, LLM controllers, agent-vs-rule comparisons |
+| **Evaluation Setting** | Explicit retrospective label delay model | Real-time bedside clinical alerting |
+| **User Interface** | Optional minimal results viewer | Operational hospital dashboards, bedside decision tools |
 
-## What this demonstrates
-1. **Federated learning works across non-IID hospital-like data splits** without centralizing raw records.
-2. **Multimodal fusion** (tabular + text) improves over single-modality baselines.
-3. **Differential privacy** can be applied client-side with a measured, honestly-reported utility cost.
-4. **The system detects data drift and recovers automatically** through triggered retraining — demonstrated live via the dashboard's Inject Drift control.
+---
 
-## Repo structure
-```
-server/, client/, privacy/     Federated orchestration, DP (Person A)
-models/, data/                 Multimodal models, preprocessing (Person B)
-monitoring/, dashboard/, infra/ Drift detection, dashboard, Docker/CI (Person C)
-config/                        Shared configuration (config/base.yaml)
-eval/, experiments/, results/  Phase 7+ research rigor (see RESEARCH_PROTOCOL.md)
-tests/                         Test suite, one file per module
-```
+## Team Ownership
 
-## Documentation index
-| Read this... | For... |
+| Role | Person | Responsibilities |
+|---|---|---|
+| **Federated Infrastructure & Privacy** | Ishthiyaq (Person A) | Flower orchestration, FedAvg baseline, Opacus DP-SGD integration, named privacy accountant, cumulative privacy ledger, communication cost logging. Builds against synthetic mock data. |
+| **Cohort, Splitting & Clinical Modeling** | Syed Hasnain (Person B) | Cohort extraction, 24h features, automated leakage tests, patient-level split, mock schema, tabular models (Logistic Regression, 2-layer MLP), clinical metrics. **Sole holder of real PhysioNet MIMIC-IV access.** |
+| **Drift Scenarios & Detection Systems** | Kiran (Person C) | Controlled drift scenario generator, natural-temporal shift evaluation, Page-Hinkley detector, validation threshold calibration, deterministic recovery controller, results registry, optional viewer. Builds against synthetic mock data. |
+
+---
+
+## Documentation Index
+
+| Document | Purpose |
 |---|---|
-| `PRODUCT_SPEC.md` | What we're building, for whom, and scope boundaries |
-| `TECH_ARCHITECTURE.md` | System diagram, module ownership, data flow guarantees |
-| `UI_UX_SPEC.md` / `DESIGN_SYSTEM.md` | Dashboard panels and visual design |
-| `AI_EXPERIENCE_SPEC.md` | Rules for presenting predictions/drift claims honestly |
-| `IMPLEMENTATION_PLAN.md` | Week-by-week build plan, links to per-role detail docs |
-| `00_SHARED_REPO_PROTOCOL.md` | Git workflow, folder ownership rules |
-| `RESEARCH_PROTOCOL.md` / `EVAL_MODULE_SPEC.md` | Phase 7+ statistical rigor and evaluation |
-| `QUALITY_BAR.md` | What "done" actually means at every level |
-| `AGENTS.md` | Instructions for AI coding agents working in this repo |
+| `docs/research/PROTOCOL.md` | **Single source of truth:** Research question (RQ1), parameters table, baselines, checklist |
+| `docs/research/decision_log.md` | Authoritative open decision register (D1–D14) |
+| `00_SHARED_REPO_PROTOCOL.md` | Mandatory git workflow, branch cycles, folder ownership, error-rectification rule |
+| `PRODUCT_SPEC.md` | Research framing, success criteria, non-negotiable boundaries |
+| `TECH_ARCHITECTURE.md` | End-to-end data-flow pipeline, privacy architecture, drift detection loop |
+| `IMPLEMENTATION_PLAN.md` | Master timeline (8–10 weeks), stage definitions, baseline status note |
+| `PersonA_Implementation_Plan.md` / `Prompt_Guide.md` | Ishthiyaq: Deliverables, test commands, fix loops |
+| `PersonB_Implementation_Plan.md` / `Prompt_Guide.md` | Syed: Deliverables, test commands, fix loops |
+| `PersonC_Implementation_Plan.md` / `Prompt_Guide.md` | Kiran: Deliverables, test commands, fix loops |
+| `EVAL_MODULE_SPEC.md` | Standardized shared evaluation module (`eval/`) |
+| `RESULTS_STORAGE_SPEC.md` | Immutable, append-only registry logging requirements (`results/registry.jsonl`) |
+| `QUALITY_BAR.md` | Definition of done, protocol checklist, claim-to-evidence mapping |
+| `docs/research/PAPER_DRAFT.md` | IEEE 4–6 page conference paper draft scaffold |
+| `AGENTS.md` | Strict instructions and documentation rules for AI coding assistants |
 
-## Setup (from a fresh clone)
+---
+
+## Setup & Local Development (Mock Data)
+
 ```bash
-git clone https://github.com/Syed8855/federated-clinical-intelligence.git
+git clone https://github.com/SyedHasnain04/federated-clinical-intelligence.git
 cd federated-clinical-intelligence
 python -m venv venv
-source venv/bin/activate        # Windows: venv\Scripts\activate
+# Linux/macOS:
+source venv/bin/activate
+# Windows PowerShell:
+.\venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+pytest tests/ -v
 ```
 
-## Running the full simulation
-```bash
-docker-compose -f infra/docker-compose.yml up
-```
-This starts 1 server container + N node containers (`NUM_NODES` env var, default 4) on a shared network.
+---
 
-## Running the dashboard
-```bash
-# once infra is up
-open http://localhost:<PORT>   # exact port set in infra/docker-compose.yml
-```
-
-## Demo runbook (self-recovery cycle)
-1. Start the full stack: `docker-compose -f infra/docker-compose.yml up`
-2. Open the dashboard, wait for the Network Overview to show all nodes Active
-3. Watch the Training Monitor climb toward the centralized baseline line
-4. Click **Inject Drift** on the Drift Timeline panel
-5. Observe: a node flips to "Drift Detected" (amber), a retraining round fires, accuracy dips then recovers — typically within a few rounds
-6. Try the Inference Panel with sample tabular + note input to see a live prediction with confidence and interpretability output
-
-## Status
-Actively in development. See `IMPLEMENTATION_PLAN.md` for current phase status per role.
-
-## Limitations
-This is a research/educational simulation, not a validated clinical tool — no prediction from this system should inform real patient care. See `docs/research/limitations.md` (added in Phase 7+) for the full, honest accounting of dataset, privacy, and validation limitations.
+## Data Governance Notice
+Real MIMIC-IV clinical records reside solely on Syed's local development machine in accordance with the PhysioNet Data Use Agreement. Collaborators build and validate modules using `data/mock_schema.py`. No patient-level records are ever committed to version control.

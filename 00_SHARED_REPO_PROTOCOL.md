@@ -2,7 +2,7 @@
 
 ## Two-stage project timeline
 - **Phases 1-6** (this document + your `Person[A/B/C]_Implementation_Plan.md`): build the working system. Do this first, in full, before anything below.
-- **Phase 7+** (`RESEARCH_PROTOCOL.md` + `EVAL_MODULE_SPEC.md`): converts the working system into a defensible research artifact — statistical rigor, ablations, failure analysis, reproducibility, final quality gate. Do not start Phase 7 queries until your Phase 6 PR is merged and a fresh-clone dry run passes. `RESEARCH_PROTOCOL.md` contains a **Master Contract** and a set of **Hard Rules (Section 39)** that apply to every person for every Phase 7+ task — read those before running any Phase 7 prompt.
+- **Phase 7+** (`RESEARCH_docs/research/PROTOCOL.md` + `EVAL_MODULE_SPEC.md`): converts the working system into a defensible research artifact — statistical rigor, ablations, failure analysis, reproducibility, final quality gate. Do not start Phase 7 queries until your Phase 6 PR is merged and a fresh-clone dry run passes. `RESEARCH_docs/research/PROTOCOL.md` contains a **Master Contract** and a set of **Hard Rules (Section 39)** that apply to every person for every Phase 7+ task — read those before running any Phase 7 prompt.
 
 Repo: single shared GitHub repo, `main` is protected (no direct pushes). Everyone works on `feature/<person>-phase<N>-<slug>` branches.
 
@@ -22,7 +22,7 @@ repo/
   tests/             # each person adds tests/test_<their_module>.py — never edit another person's test file
   README.md          # Person C owns top-level; each module folder has its own README.md owned by that person
 
-  # Phase 7+ additions (see RESEARCH_PROTOCOL.md — do not start these until Phases 1-6 are merged)
+  # Phase 7+ additions (see RESEARCH_docs/research/PROTOCOL.md — do not start these until Phases 1-6 are merged)
   experiments/       # shared — configs + CLI, Kiran leads scaffolding, A+B add their own configs
   eval/              # shared, co-owned — see EVAL_MODULE_SPEC.md. Mandatory cross-review, see exception below.
   results/           # generated only — never hand-edited; raw output gitignored, only committed summary tables/plots

@@ -1,74 +1,97 @@
 # TECH_ARCHITECTURE.md
 
-## System overview
+## System Overview & Data-Flow Pipeline
+
 ```
-MIMIC-IV data
-      │
-      ▼
-data/partition.py (Person A)  ──►  3-5 non-IID node partitions
-      │                              (data/nodes/node_{i}/)
-      ▼
-data/preprocessing.py (Person B)  ──►  cleaned tabular + text per node
-      │
-      ▼
-┌─────────────────────────────────────────────────────┐
-│  Simulated hospital nodes (Docker containers, infra/)│
-│  client/client_app.py (Person A)                     │
-│  wraps models/fusion.py (Person B)                   │
-│  + privacy/dp_wrapper.py (Person A, Opacus)          │
-└─────────────────────────────────────────────────────┘
-      │  model weight updates only — never raw data
-      ▼
-server/server_app.py (Person A) — Flower FedAvg aggregation
-      │
-      ├──► monitoring/logger.py (Person C) — per-round metrics
-      │           │
-      │           ▼
-      │     monitoring/drift_detector.py (Person C)
-      │           │  drift flagged?
-      │           ▼
-      │     server/trigger_retrain.py (Person A) — new round outside schedule
-      │
-      ▼
-Global model (best checkpoint) ──► models/inference.py (Person B)
-      │
-      ▼
-dashboard/ (Person C) — FastAPI + frontend, all 5 panels, see UI_UX_SPEC.md
+[MIMIC-IV v3.1 Structured EHR] (Syed's machine only)
+              │
+              ▼
+[24h Landmark Cohort Extraction] (data/cohort.py)
+  - Adult cohort, first ICU stay, 24h landmark
+  - Leakage checks (no post-landmark or outcome-derived features)
+              │
+              ▼
+[Patient-Level Train / Val / Test Split] (data/split.py)
+  - Strictly by subject_id before client partitioning
+  - Zero subject overlap across splits
+              │
+              ▼
+[Client Partitioning] (data/partition.py)
+  - 3-5 partitions (5 pilot target)
+  - Natural partition via first_careunit (train split only)
+  - Global validation and test splits
+              │
+              ▼
+[Federated Training Loop: Flower FedAvg + DP-SGD] (client/, server/, privacy/)
+  - Centralized reference vs non-private FedAvg vs DP-FedAvg
+  - Record-level DP-SGD (Opacus): clipping norm C=1.0, epsilon in {1, 3, 8}, delta=1e-5 (PROPOSED)
+  - Model weights exchanged; raw clinical records remain local
+              │
+              ▼
+[Per-Round Client Prediction Evaluation] (monitoring/eval_stream.py)
+  - Sliding evaluation window (256 eligible examples per client-window)
+  - Stream simulation with explicit label-delay model (retrospective mortality labels)
+  - Client mean prediction log loss computed
+              │
+              ▼
+[Runtime Drift Detection: Page-Hinkley] (monitoring/detector.py)
+  - Evaluated on log-loss stream
+  - Calibrated on stable validation runs (target <= 5% false alarms); never on test
+              │
+              ▼
+[Deterministic Rule-Based Controller] (monitoring/controller.py)
+  - Two consecutive alarms on same client trigger recovery
+  - 5-round cooldown period
+  - Actions: No-op / Local Retraining / Global Retraining
+  - Fixed across privacy conditions
+              │
+              ▼
+[Cumulative Privacy Ledger & Metrics Logging] (eval/, results/registry.jsonl)
+  - Cumulative (epsilon, delta) tracking via named RDP/PRV accountant + cross-check
+  - Event-level detection metrics, clinical AUROC, recovery trajectory, communication cost
 ```
 
-## Module ownership (see `00_SHARED_REPO_PROTOCOL.md` for the enforced folder rule)
+## Module Ownership (see `00_SHARED_REPO_docs/research/PROTOCOL.md`)
+
 | Folder | Owner | Responsibility |
 |---|---|---|
-| `server/`, `client/`, `privacy/` | Person A (Ishthiyaq) | Flower orchestration, FedAvg, DP, fault tolerance, retrain trigger — builds/tests against `data/mock_schema.py` only |
-| `models/`, `data/preprocessing.py`, `data/partition.py`, `data/mock_schema.py` | Person B (Syed) | **Sole holder of PhysioNet-credentialed MIMIC-IV access.** Tabular/text/fusion models, preprocessing, partitioning, real dataset + training, mock schema for teammates, inference, ablations |
-| `monitoring/`, `dashboard/`, `infra/` | Person C (Kiran) | Drift detection, retraining loop trigger consumer, dashboard, Docker/CI — builds/tests against `data/mock_schema.py` only |
-| `config/base.yaml` | Shared | All tunable parameters — see below |
-| `eval/`, `experiments/`, `results/` | Shared (Phase 7+) | Metrics, statistical rigor, reproducible experiment runs — see `EVAL_MODULE_SPEC.md` |
+| `data/cohort.py`, `data/split.py`, `data/partition.py`, `data/mock_schema.py`, `models/` | Syed (Person B) | **Sole PhysioNet-credentialed MIMIC-IV holder.** Cohort extraction, 24h features, leakage tests, patient-level split, mock schema generator, tabular models (Logistic Regression, 2-hidden-layer MLP), metrics/calibration, real data runs. |
+| `client/`, `server/`, `privacy/` | Ishthiyaq (Person A) | Flower orchestration, FedAvg baseline, record-level DP-SGD (Opacus), named privacy accountant and independent cross-check, cumulative privacy ledger, communication and compute cost logging. |
+| `monitoring/`, `infra/`, (optional `viewer/`) | Kiran (Person C) | Synthetic drift scenario generator (abrupt, gradual, localized, global), natural-temporal scenario, Page-Hinkley detector, detection metrics, deterministic rule-based controller, optional minimal research viewer. |
+| `config/base.yaml` | Shared | Shared configuration parameters (all PROPOSED until protocol freeze). Changes require explicit PR review. |
+| `eval/`, `results/` | Co-owned | Metric schemas, statistical evaluation, append-only `results/registry.jsonl`. |
 
-## Data flow guarantees (non-negotiable, testable)
-1. Raw patient data never leaves the node it's partitioned into — only `state_dict` weight updates cross the client→server boundary.
-2. No patient ID appears in more than one node's partition (tested in Person B's Phase 2).
-3. Preprocessing statistics (imputation means, scalers) are computed per-node, never globally, to avoid cross-node information leakage (tested in Person B's Phase 2).
-4. Differential privacy noise is injected client-side before any update leaves the node (Opacus `PrivacyEngine`, Person A Phase 4).
-5. **Real MIMIC-IV data exists only on Person B's machine.** Person A and Person C never receive real patient data in any form — they build and test exclusively against `data/mock_schema.py` synthetic data with matching schema. This is enforced by `.gitignore` (no `.parquet`/`data/nodes/` committed) and by process (Person B never sends raw/derived data files to teammates).
+## Data Governance & Leakage Guarantees
 
-## Deployment topology
-Single-machine simulation via Docker Compose: 1 server container + N node containers (N=3-5, configurable via `NUM_NODES` env var), all on a shared `fl-net` Docker network. This simulates — but does not implement — real multi-institution networking. See `infra/docker-compose.yml` (Person C, Phase 2).
+1. **Real Data Boundary**: Real MIMIC-IV v3.1 data exists solely on Syed's local development machine. Collaborators (Ishthiyaq and Kiran) build and test their modules exclusively against `data/mock_schema.py` synthetic datasets matching the schema. No raw patient records or derived patient-level Parquet files are ever committed to GitHub (`.gitignore` enforces this).
+2. **Patient Isolation**: The patient-level split occurs strictly before client partitioning. No `subject_id` is ever shared between train, validation, and test splits.
+3. **Partition Isolation**: Clients are distinct data partitions of the single dataset. No client accesses another client's local records; only model weight parameters (`state_dict`) cross the network boundary.
+4. **Leakage Safeguards**: Only structured observations from the first 24 hours of ICU admission are included. Future events, discharge timestamps, post-landmark interventions, and outcome-derived features are strictly excluded by automated leakage tests.
+5. **Preprocessing Isolation**: Feature transformations (imputation statistics, standardizers) are fitted strictly on the training partition of each client to prevent cross-split or cross-client information leakage.
 
-## Config (`config/base.yaml`) — single source of truth for tunable parameters
-`num_nodes`, `rounds`, `local_epochs`, `batch_size`, `lr`, `dp_enabled`, `dp_epsilon`, `dp_delta`, `dp_max_grad_norm`, `drift_threshold`, `drift_check_window`, `min_fit_clients`, `fraction_fit`. Exact defaults and types specified in `PersonA_Implementation_Plan.md` Phase 1. Any change to this file requires flagging in a PR per the shared protocol — it's read by all three modules.
+## Privacy & Accounting Architecture
 
-## Model architecture (Person B)
-- `TabularEncoder`: MLP, tabular EHR features → 16-dim embedding or 1 logit
-- `TextEncoder`: frozen ClinicalBERT (768-dim) or lightweight TF-IDF+MLP (64-dim), decision recorded in `models/text.py`
-- `FusionModel`: concatenates both embeddings → MLP head → 1 sigmoid logit (severity/mortality)
-- Interpretability: SHAP for tabular features, attention-weights for text tokens (Phase 6)
+- **Mechanism**: Record-level DP-SGD applied locally during client training via Opacus.
+- **Candidate Privacy Targets**: $\varepsilon \in \{1, 3, 8\}$, $\delta = 10^{-5}$, clipping norm $C = 1.0$ (PROPOSED; subject to pilot sensitivity).
+- **Privacy Accountant**: Named Renyi Differential Privacy (RDP) or Privacy Random Variable (PRV) accountant, with an independent implementation cross-check. All steps, sampling rates, noise multipliers, and clipping norms are logged.
+- **Ledger Scope**: Tracks cumulative $(\varepsilon, \delta)$ expenditure across rounds and retraining events. If a recovery retraining step would exhaust the declared privacy budget, retraining is refused per budget-exhaustion policy (see `decision_log.md` D5).
 
-## Metrics & logging pipeline (Phase 7+, see `EVAL_MODULE_SPEC.md`)
-Every experiment run produces one `ExperimentResult` record (`eval/results_schema.py`) written to `results/registry.jsonl`. All plots and statistical comparisons read exclusively from this registry — no hand-typed numbers anywhere downstream.
+## Drift Detection & Recovery Architecture
 
-## Why these technology choices
-- **Flower**: simplest FL framework to simulate multiple clients on one machine, framework-agnostic with PyTorch
-- **Opacus**: standard PyTorch-native DP library, integrates directly with the client training loop
-- **Frozen ClinicalBERT (if chosen)**: avoids federated fine-tuning cost of a full transformer — embeddings computed once per node, cached, and reused across rounds, keeping communication cost low
-- **Docker Compose over real multi-machine networking**: matches the stated project scope (simulated nodes on one machine) while still producing an architecturally accurate system diagram
+- **Monitored Signal**: Client-level mean prediction log loss evaluated on a sliding window of 256 eligible examples.
+- **Detector**: Page-Hinkley test running on each client's prediction error stream.
+- **Calibration Policy**: Thresholds calibrated strictly on stable validation runs to achieve $\le 5\%$ false-alarm rate across stable client-windows (see `decision_log.md` D1); test data is never used for calibration.
+- **Label Delay Model**: Mortality labels exist only retrospectively at hospital discharge; stream simulation explicitly incorporates this label delay model, avoiding false claims of real-time operational detection.
+- **Controller**: Deterministic rule-based recovery controller with a two-consecutive-alarm trigger and a 5-round cooldown period. Evaluates three recovery actions:
+  - *No-op*: Continue routine federated training.
+  - *Local retraining*: Retrain affected client on recent window.
+  - *Global retraining*: Trigger global federated rounds across participating clients.
+- The controller policy is held completely constant across privacy levels to isolate the effect of DP strength on detection and recovery.
+
+## Minimal Results Viewer (Optional)
+A minimal, lightweight research visualization tool (optional under Person C scope) to display:
+1. Federation convergence and per-round test AUROC.
+2. Client-level log-loss streams with Page-Hinkley detector decision functions and alarm flags.
+3. Privacy ledger status (cumulative $\varepsilon$ vs round).
+4. Drift injection timestamps and recovery controller actions.
+*(Replaces any operational multi-panel hospital dashboard; out of scope).*
