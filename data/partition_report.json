@@ -1,0 +1,44 @@
+{
+  "strategy": "dirichlet",
+  "num_clients": 3,
+  "seed": 42,
+  "alpha": 0.3,
+  "clients": {
+    "client_0": {
+      "n_samples": 45,
+      "mortality_count": 44,
+      "mortality_prevalence": 0.9778,
+      "careunits": {
+        "MICU": 19,
+        "SICU": 10,
+        "CCU": 8,
+        "CVICU": 5,
+        "TSICU": 3
+      }
+    },
+    "client_1": {
+      "n_samples": 21,
+      "mortality_count": 16,
+      "mortality_prevalence": 0.7619,
+      "careunits": {
+        "MICU": 11,
+        "CCU": 3,
+        "SICU": 3,
+        "CVICU": 2,
+        "TSICU": 2
+      }
+    },
+    "client_2": {
+      "n_samples": 634,
+      "mortality_count": 29,
+      "mortality_prevalence": 0.0457,
+      "careunits": {
+        "MICU": 231,
+        "SICU": 161,
+        "CVICU": 94,
+        "CCU": 85,
+        "TSICU": 63
+      }
+    }
+  }
+}

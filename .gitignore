@@ -3,6 +3,7 @@
 # Data Use Agreement prohibits redistribution
 # ============================================
 data/nodes/
+data/splits/
 data/raw/
 data/*.csv
 data/*.parquet
