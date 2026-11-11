@@ -5,11 +5,38 @@ Supports fixing the classification operating point threshold on validation
 data before evaluating on the test set.
 """
 
-from typing import Dict, Optional
+import math
+from typing import Dict, Tuple
 import numpy as np
 from sklearn.metrics import roc_auc_score, average_precision_score
 
 from eval.calibration import compute_calibration
+
+
+def _validate_binary_classification_inputs(
+    y_true: np.ndarray,
+    y_pred_proba: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Validates binary ground-truth labels and finite predicted probabilities."""
+    y_true_float = np.asarray(y_true, dtype=float)
+    y_proba = np.asarray(y_pred_proba, dtype=float)
+
+    if y_true_float.size == 0 or y_proba.size == 0:
+        raise ValueError("y_true and y_pred_proba must not be empty.")
+    if y_true_float.shape != y_proba.shape:
+        raise ValueError(
+            f"Shape mismatch between y_true {y_true_float.shape} and y_pred_proba {y_proba.shape}."
+        )
+    if not np.all(np.isfinite(y_true_float)):
+        raise ValueError("y_true contains NaN or non-finite values.")
+    if not np.all(np.isin(y_true_float, (0.0, 1.0))):
+        raise ValueError("y_true must contain only binary class labels {0, 1}.")
+    if not np.all(np.isfinite(y_proba)):
+        raise ValueError(
+            "y_pred_proba contains NaN or non-finite values; cannot compute valid clinical metrics."
+        )
+
+    return y_true_float.astype(int), y_proba
 
 
 def find_best_operating_point(
@@ -22,8 +49,7 @@ def find_best_operating_point(
 
     Must be called on validation data BEFORE evaluating test data.
     """
-    y_true = np.asarray(y_true, dtype=int)
-    y_pred_proba = np.asarray(y_pred_proba, dtype=float)
+    y_true, y_pred_proba = _validate_binary_classification_inputs(y_true, y_pred_proba)
 
     thresholds = np.linspace(0.01, 0.99, n_thresholds)
     best_score = -1.0
@@ -79,8 +105,13 @@ def compute_metrics(
           "n_samples": int, "positive_rate": float, "threshold": float
         }
     """
-    y_true = np.asarray(y_true, dtype=int)
-    y_pred_proba = np.asarray(y_pred_proba, dtype=float)
+    y_true, y_pred_proba = _validate_binary_classification_inputs(y_true, y_pred_proba)
+    if (
+        isinstance(threshold, bool)
+        or not isinstance(threshold, (int, float))
+        or not math.isfinite(float(threshold))
+    ):
+        raise ValueError(f"threshold must be a finite number, got {threshold!r}.")
 
     n_samples = len(y_true)
     positive_rate = float(np.mean(y_true)) if n_samples > 0 else 0.0
@@ -99,16 +130,10 @@ def compute_metrics(
     specificity = float(tn / (tn + fp)) if (tn + fp) > 0 else 0.0
     f1 = float(2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
 
-    # Discriminative area metrics (guard against single-class arrays)
+    # Discriminative area metrics (legitimate single-class fallback only when predictions are valid/finite)
     if len(np.unique(y_true)) > 1:
-        try:
-            auroc = float(roc_auc_score(y_true, y_pred_proba))
-        except Exception:
-            auroc = 0.5
-        try:
-            auprc = float(average_precision_score(y_true, y_pred_proba))
-        except Exception:
-            auprc = positive_rate
+        auroc = float(roc_auc_score(y_true, y_pred_proba))
+        auprc = float(average_precision_score(y_true, y_pred_proba))
     else:
         auroc = 0.5
         auprc = positive_rate
