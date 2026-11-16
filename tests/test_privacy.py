@@ -4,6 +4,7 @@ import copy
 import numpy as np
 import pytest
 import torch
+from opacus.accountants import create_accountant
 
 from client.client_app import FLClient
 from data.mock_schema import generate_mock_data
@@ -120,6 +121,34 @@ def test_compute_prospective_epsilon_non_mutating_and_exact(partitioned_clients_
     client.fit(params, config={"local_epochs": 1, "server_round": 2})
     eps_after_3 = get_realized_epsilon(client.privacy_engine, 1e-5)
     assert eps_after_3 == pytest.approx(prosp_3, abs=1e-9)
+
+
+def test_compute_prospective_epsilon_prv_sample_rate_1_fails_closed():
+    """Verifies compute_prospective_epsilon fails closed for PRV at q=1.0 and succeeds for RDP at q=1.0."""
+    prv_acct = create_accountant(mechanism="prv")
+    rdp_acct = create_accountant(mechanism="rdp")
+
+    # PRV at q=1.0 must fail with descriptive error
+    with pytest.raises(ValueError, match="accountant='prv' cannot be used with sample_rate=1.0"):
+        compute_prospective_epsilon(
+            prv_acct,
+            delta=1e-5,
+            noise_multiplier=1.2,
+            sample_rate=1.0,
+            num_steps=1,
+        )
+
+    # RDP at q=1.0 must succeed
+    eps_rdp = compute_prospective_epsilon(
+        rdp_acct,
+        delta=1e-5,
+        noise_multiplier=1.2,
+        sample_rate=1.0,
+        num_steps=1,
+    )
+    assert isinstance(eps_rdp, float)
+    assert eps_rdp > 0.0
+
 
 
 def test_non_private_accounting_uses_none_and_excludes_from_dp_comparisons(partitioned_clients_data):

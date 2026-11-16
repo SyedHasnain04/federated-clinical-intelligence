@@ -114,16 +114,34 @@ def _validate_accountant(accountant: Any) -> str:
     return accountant
 
 
-def _validate_accountant_sample_rate(accountant: str, sample_rate: float) -> None:
-    """Rejects ``accountant='prv'`` at ``sample_rate == 1.0`` where Opacus PRV breaks."""
-    if accountant == "prv" and sample_rate == 1.0:
+def validate_accountant_sample_rate(accountant: str, sample_rate: float) -> None:
+    """Rejects ``accountant='prv'`` at ``sample_rate >= 1.0`` where Opacus PRV breaks.
+
+    Parameters
+    ----------
+    accountant : str
+        Accountant mechanism name (e.g. 'rdp' or 'prv').
+    sample_rate : float
+        Effective Poisson sampling rate q.
+
+    Raises
+    ------
+    ValueError
+        If ``accountant='prv'`` and ``sample_rate >= 1.0`` (or numerically close to 1.0).
+    """
+    normalized_accountant = str(accountant).strip().lower()
+    sr = float(sample_rate)
+    if normalized_accountant == "prv" and (sr >= 1.0 or math.isclose(sr, 1.0, rel_tol=1e-6, abs_tol=1e-9)):
         raise ValueError(
-            "accountant='prv' cannot be used with sample_rate=1.0: PRV accounting at "
+            f"accountant='prv' cannot be used with sample_rate={sr}: PRV accounting at "
             "sample_rate=1.0 is numerically problematic in the installed Opacus 1.5.4 "
             "version (PoissonSubsampledGaussianPRV evaluates log(1 - sample_rate), "
             "causing divide-by-zero instability). Use accountant='rdp' (which supports "
             "sample_rate=1.0) or reduce batch_size so len(data_loader) > 1 (sample_rate < 1.0)."
         )
+
+
+_validate_accountant_sample_rate = validate_accountant_sample_rate
 
 
 @dataclass(frozen=True)
@@ -610,7 +628,7 @@ def attach_privacy_engine(
         accountant=dp_config.accountant,
         secure_mode=dp_config.secure_mode,
     )
-    private_model, dp_optimizer, dp_data_loader = privacy_engine.make_private(
+    make_private_result = privacy_engine.make_private(
         module=model,
         optimizer=optimizer,
         data_loader=loader_for_opacus,
@@ -623,6 +641,9 @@ def attach_privacy_engine(
         noise_generator=noise_generator,
         grad_sample_mode="hooks",
     )
+    private_model = make_private_result[0]
+    dp_optimizer = make_private_result[1]
+    dp_data_loader = make_private_result[-1]
 
     base_model = getattr(private_model, "_module", model)
 

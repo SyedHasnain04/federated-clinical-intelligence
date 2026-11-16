@@ -11,6 +11,7 @@ from privacy.dp_wrapper import (
     calibrate_noise_multiplier,
     extract_privacy_summary,
     get_realized_epsilon,
+    validate_accountant_sample_rate,
     validate_model_for_dp,
 )
 
@@ -25,6 +26,7 @@ __all__ = [
     "calibrate_noise_multiplier",
     "extract_privacy_summary",
     "get_realized_epsilon",
+    "validate_accountant_sample_rate",
     "validate_model_for_dp",
 ]
 

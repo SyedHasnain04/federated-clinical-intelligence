@@ -16,6 +16,7 @@ from privacy.dp_wrapper import (
     calibrate_noise_multiplier,
     extract_privacy_summary,
     get_realized_epsilon,
+    validate_accountant_sample_rate,
     validate_model_for_dp,
 )
 
@@ -393,4 +394,20 @@ def test_additional_dp_wrapper_guards_and_extract_summary():
 
     with pytest.raises(TypeError, match="Expected PrivacyEngine"):
         extract_privacy_summary("bad", cfg_ok)  # type: ignore[arg-type]
+
+
+def test_validate_accountant_sample_rate_function():
+    """Directly verifies validate_accountant_sample_rate behavior for RDP vs PRV at sample_rate=1.0."""
+    # RDP passes at sample_rate=1.0 and below
+    validate_accountant_sample_rate("rdp", 1.0)
+    validate_accountant_sample_rate("rdp", 0.5)
+
+    # PRV passes below 1.0
+    validate_accountant_sample_rate("prv", 0.9)
+
+    # PRV fails at 1.0 or numerically close to 1.0
+    with pytest.raises(ValueError, match="accountant='prv' cannot be used with sample_rate=1.0"):
+        validate_accountant_sample_rate("prv", 1.0)
+    with pytest.raises(ValueError, match="accountant='prv' cannot be used with sample_rate="):
+        validate_accountant_sample_rate("prv", 0.99999999999)
 

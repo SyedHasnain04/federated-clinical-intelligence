@@ -24,10 +24,15 @@ from eval.privacy_ledger import (
     compute_prospective_epsilon,
 )
 from models.baseline import (
+    CANONICAL_FEATURES,
+    CANONICAL_FEATURE_DIM,
     BaseModel,
     LogisticRegressionModel,
     MLPModel,
     TabularPreprocessor,
+    validate_batch_size,
+    validate_binary_labels,
+    validate_canonical_features,
 )
 from privacy.dp_wrapper import (
     DPAttachmentResult,
@@ -35,11 +40,109 @@ from privacy.dp_wrapper import (
     attach_privacy_engine,
     extract_privacy_summary,
     get_realized_epsilon,
+    validate_accountant_sample_rate,
 )
 
 logger = logging.getLogger(__name__)
 
 SUPPORTED_OPTIMIZER_TYPES: Tuple[str, ...] = ("adam", "sgd")
+
+
+def validate_local_epochs(local_epochs: Any) -> int:
+    """Validates and returns local_epochs as a strictly positive Python integer.
+
+    Parameters
+    ----------
+    local_epochs : Any
+        Requested number of local training epochs per round.
+
+    Returns
+    -------
+    int
+        Validated positive integer.
+
+    Raises
+    ------
+    TypeError
+        If ``local_epochs`` is a bool or not an instance of int (e.g. float, str, None).
+    ValueError
+        If ``local_epochs`` is less than or equal to 0.
+    """
+    if isinstance(local_epochs, bool) or not isinstance(local_epochs, int):
+        raise TypeError(
+            f"local_epochs must be an int, got {type(local_epochs).__name__} ({local_epochs!r})."
+        )
+    if local_epochs <= 0:
+        raise ValueError(
+            f"local_epochs must be a positive integer (> 0), got {local_epochs!r}."
+        )
+    return local_epochs
+
+
+def validate_learning_rate(lr: Any) -> float:
+    """Validates and returns learning rate as a strictly positive finite float.
+
+    Parameters
+    ----------
+    lr : Any
+        Requested learning rate.
+
+    Returns
+    -------
+    float
+        Validated positive finite float.
+
+    Raises
+    ------
+    TypeError
+        If ``lr`` is a bool or not an instance of (int, float, np.floating, np.integer).
+    ValueError
+        If ``lr`` is non-finite (NaN, Inf) or less than or equal to 0.0.
+    """
+    if isinstance(lr, (bool, np.bool_)) or not isinstance(lr, (int, float, np.floating, np.integer)):
+        raise TypeError(
+            f"lr must be a float or int, got {type(lr).__name__} ({lr!r})."
+        )
+    val = float(lr)
+    if not math.isfinite(val) or val <= 0.0:
+        raise ValueError(
+            f"lr must be strictly positive and finite, got {lr!r}."
+        )
+    return val
+
+
+def validate_weight_decay(weight_decay: Any) -> float:
+    """Validates and returns weight decay as a non-negative finite float.
+
+    Parameters
+    ----------
+    weight_decay : Any
+        Requested weight decay coefficient.
+
+    Returns
+    -------
+    float
+        Validated non-negative finite float.
+
+    Raises
+    ------
+    TypeError
+        If ``weight_decay`` is a bool or not an instance of (int, float, np.floating, np.integer).
+    ValueError
+        If ``weight_decay`` is non-finite (NaN, Inf) or strictly negative (< 0.0).
+    """
+    if isinstance(weight_decay, (bool, np.bool_)) or not isinstance(
+        weight_decay, (int, float, np.floating, np.integer)
+    ):
+        raise TypeError(
+            f"weight_decay must be a float or int, got {type(weight_decay).__name__} ({weight_decay!r})."
+        )
+    val = float(weight_decay)
+    if not math.isfinite(val) or val < 0.0:
+        raise ValueError(
+            f"weight_decay must be non-negative and finite, got {weight_decay!r}."
+        )
+    return val
 
 
 def validate_optimizer_config(
@@ -66,6 +169,52 @@ def validate_optimizer_config(
             f"momentum must be 0.0 when optimizer_type='adam', got {momentum!r}."
         )
     return normalized_optimizer, momentum_f
+
+
+def validate_client_preprocessor(
+    preprocessor: Any,
+    client_id: Any = None,
+) -> TabularPreprocessor:
+    """Validates that a client preprocessor exists, is a TabularPreprocessor, is fitted, and matches canonical schema.
+
+    Parameters
+    ----------
+    preprocessor : Any
+        Preprocessor instance to validate.
+    client_id : Any, optional
+        Client identifier for error attribution.
+
+    Returns
+    -------
+    TabularPreprocessor
+        Validated preprocessor.
+
+    Raises
+    ------
+    TypeError
+        If preprocessor is None or not a TabularPreprocessor instance.
+    RuntimeError
+        If preprocessor has not been fit.
+    ValueError
+        If preprocessor.feature_cols does not match CANONICAL_FEATURES.
+    """
+    prefix = f"Client {client_id}: " if client_id is not None else "Client: "
+    if preprocessor is None:
+        raise TypeError(f"{prefix}preprocessor cannot be None; a fitted TabularPreprocessor is required.")
+    if not isinstance(preprocessor, TabularPreprocessor):
+        raise TypeError(
+            f"{prefix}preprocessor must be an instance of TabularPreprocessor, got {type(preprocessor).__name__}."
+        )
+    if (
+        preprocessor.medians_ is None
+        or preprocessor.means_ is None
+        or preprocessor.stds_ is None
+        or preprocessor.feature_cols is None
+    ):
+        raise RuntimeError(f"{prefix}received a preprocessor that has not been fit.")
+
+    validate_canonical_features(preprocessor.feature_cols)
+    return preprocessor
 
 
 class FLClient(fl.client.NumPyClient):
@@ -95,6 +244,7 @@ class FLClient(fl.client.NumPyClient):
         budget_check_mode: str = "step",
         optimizer_type: str = "adam",
         momentum: float = 0.0,
+        require_preprocessor: bool = False,
     ):
         """Initializes client with independent local state, preprocessor, and optional DP.
 
@@ -131,8 +281,9 @@ class FLClient(fl.client.NumPyClient):
             Default Adam weight decay coefficient.
         reset_optimizer_each_round : bool
             If True (default, matching Phase 1), clears Adam optimizer moment
-            state at the start of each DP ``fit()`` round while keeping the
-            Opacus ``PrivacyEngine`` and ``DPOptimizer`` intact.
+            state and SGD momentum buffers at the start of each ``fit()`` round
+            (both non-private and private) while keeping the persistent optimizer
+            and Opacus ``PrivacyEngine`` intact.
         epsilon_budget : Optional[float]
             Optional cumulative epsilon cap enforced before DP fit rounds and
             optimizer steps. When ``dp_config`` is calibrated from
@@ -153,12 +304,14 @@ class FLClient(fl.client.NumPyClient):
             raise ValueError(f"Client {client_id} training partition is empty.")
         if len(val_df) == 0:
             raise ValueError(f"Client {client_id} validation partition is empty.")
+        validated_batch_size = validate_batch_size(batch_size)
         if dp_config is not None and not isinstance(dp_config, DPConfig):
             raise TypeError(f"dp_config must be a DPConfig or None, got {type(dp_config).__name__}.")
         if isinstance(planned_rounds, bool) or not isinstance(planned_rounds, int) or planned_rounds <= 0:
             raise ValueError(f"planned_rounds must be a positive integer, got {planned_rounds!r}.")
-        if isinstance(local_epochs, bool) or not isinstance(local_epochs, int) or local_epochs <= 0:
-            raise ValueError(f"local_epochs must be a positive integer, got {local_epochs!r}.")
+        validated_local_epochs = validate_local_epochs(local_epochs)
+        validated_lr = validate_learning_rate(lr)
+        validated_weight_decay = validate_weight_decay(weight_decay)
         if not isinstance(reset_optimizer_each_round, bool):
             raise TypeError("reset_optimizer_each_round must be a bool.")
         if budget_check_mode not in {"step", "round"}:
@@ -182,14 +335,14 @@ class FLClient(fl.client.NumPyClient):
 
         self.client_id = client_id
         self.model_type = model_type
-        self.batch_size = batch_size
+        self.batch_size = validated_batch_size
         self.client_seed = int(base_seed * 1000 + client_id)
         self.dp_config = dp_config if dp_config is not None else DPConfig(dp_enabled=False)
         self.dp_enabled = self.dp_config.dp_enabled
         self.planned_rounds = planned_rounds
-        self.planned_local_epochs = local_epochs
-        self.default_lr = float(lr)
-        self.default_weight_decay = float(weight_decay)
+        self.planned_local_epochs = validated_local_epochs
+        self.default_lr = validated_lr
+        self.default_weight_decay = validated_weight_decay
         self.reset_optimizer_each_round = reset_optimizer_each_round
         self.budget_check_mode = str(budget_check_mode)
         self.optimizer_type = normalized_optimizer
@@ -208,15 +361,12 @@ class FLClient(fl.client.NumPyClient):
 
         # 2. Shared or fallback local preprocessor
         if preprocessor is not None:
-            if (
-                preprocessor.medians_ is None
-                or preprocessor.means_ is None
-                or preprocessor.stds_ is None
-            ):
-                raise RuntimeError(
-                    f"Client {client_id} received a preprocessor that has not been fit."
-                )
-            self.preprocessor = preprocessor
+            self.preprocessor = validate_client_preprocessor(preprocessor, client_id=client_id)
+        elif require_preprocessor:
+            raise TypeError(
+                f"Client {client_id}: preprocessor cannot be None when require_preprocessor=True; "
+                "a fitted TabularPreprocessor is required."
+            )
         else:
             # Standalone fallback: fit locally on client train partition
             logger.warning(
@@ -232,17 +382,31 @@ class FLClient(fl.client.NumPyClient):
         if y_train is None or y_val is None:
             raise ValueError(f"Client {client_id} partition is missing 'in_hospital_mortality' labels.")
 
+        validated_y_train = validate_binary_labels(y_train, context=f"Client {client_id} train")
+        validated_y_val = validate_binary_labels(y_val, context=f"Client {client_id} val")
+
+        if X_train.shape[1] != CANONICAL_FEATURE_DIM:
+            raise ValueError(
+                f"Client {client_id} transformed training matrix has {X_train.shape[1]} columns; "
+                f"expected exactly {CANONICAL_FEATURE_DIM} canonical features."
+            )
+        if X_val.shape[1] != CANONICAL_FEATURE_DIM:
+            raise ValueError(
+                f"Client {client_id} transformed validation matrix has {X_val.shape[1]} columns; "
+                f"expected exactly {CANONICAL_FEATURE_DIM} canonical features."
+            )
+
         self.num_train_samples = len(X_train)
         self.num_val_samples = len(X_val)
 
         # 3. Local PyTorch DataLoaders with isolated generator
         train_dataset = TensorDataset(
             torch.tensor(X_train, dtype=torch.float32),
-            torch.tensor(y_train, dtype=torch.float32),
+            torch.tensor(validated_y_train, dtype=torch.float32),
         )
         val_dataset = TensorDataset(
             torch.tensor(X_val, dtype=torch.float32),
-            torch.tensor(y_val, dtype=torch.float32),
+            torch.tensor(validated_y_val, dtype=torch.float32),
         )
 
         self.train_loader = DataLoader(
@@ -258,7 +422,7 @@ class FLClient(fl.client.NumPyClient):
         )
 
         # 4. Independent model instance (strictly unshared between clients)
-        input_dim = X_train.shape[1]
+        input_dim = CANONICAL_FEATURE_DIM
         if model_type == "logistic_regression":
             self.model: BaseModel = LogisticRegressionModel(input_dim=input_dim)
         elif model_type == "mlp":
@@ -266,7 +430,8 @@ class FLClient(fl.client.NumPyClient):
         else:
             raise ValueError(f"Unknown model_type: '{model_type}'. Choose 'logistic_regression' or 'mlp'.")
 
-        # 5. Optional one-time Opacus PrivacyEngine attachment (persistent across rounds)
+        # 5. Persistent optimizer setup (non-private or one-time Opacus PrivacyEngine attachment)
+        self.optimizer: Optional[optim.Optimizer] = None
         self.dp_attachment: Optional[DPAttachmentResult] = None
         self.dp_module: Optional[nn.Module] = None
         self.dp_optimizer: Optional[optim.Optimizer] = None
@@ -330,6 +495,13 @@ class FLClient(fl.client.NumPyClient):
                 self.epsilon_budget = float(epsilon_budget) if epsilon_budget is not None else None
         else:
             self.epsilon_budget = None
+            if self.model.net is None:
+                raise RuntimeError(f"Client {self.client_id} model network is not initialized.")
+            self.optimizer = self._build_base_optimizer(
+                self.model.net.parameters(),
+                lr=self.default_lr,
+                weight_decay=self.default_weight_decay,
+            )
 
     def _build_base_optimizer(
         self,
@@ -339,14 +511,16 @@ class FLClient(fl.client.NumPyClient):
         weight_decay: float,
     ) -> optim.Optimizer:
         """Constructs the configured PyTorch optimizer (Adam or SGD with momentum)."""
+        validated_lr = validate_learning_rate(lr)
+        validated_weight_decay = validate_weight_decay(weight_decay)
         if self.optimizer_type == "adam":
-            return optim.Adam(params, lr=lr, weight_decay=weight_decay)
+            return optim.Adam(params, lr=validated_lr, weight_decay=validated_weight_decay)
         if self.optimizer_type == "sgd":
             return optim.SGD(
                 params,
-                lr=lr,
+                lr=validated_lr,
                 momentum=self.momentum,
-                weight_decay=weight_decay,
+                weight_decay=validated_weight_decay,
             )
         raise ValueError(
             f"Unsupported optimizer_type {self.optimizer_type!r}; choose 'adam' or 'sgd'."
@@ -370,6 +544,10 @@ class FLClient(fl.client.NumPyClient):
     def _compute_prospective_steps_epsilon(self, num_steps: int) -> float:
         if self.privacy_engine is None or self.dp_attachment is None:
             raise RuntimeError(f"Client {self.client_id} DP components are not initialized.")
+        validate_accountant_sample_rate(
+            self.dp_config.accountant,
+            self.dp_attachment.sample_rate,
+        )
         return compute_prospective_epsilon(
             privacy_engine_or_accountant=self.privacy_engine,
             delta=self.dp_config.delta,
@@ -385,8 +563,10 @@ class FLClient(fl.client.NumPyClient):
             or self.dp_attachment is None
         ):
             return None
-        if self.dp_config.accountant == "prv" and self.dp_attachment.sample_rate == 1.0:
-            return None
+        validate_accountant_sample_rate(
+            self.dp_config.accountant,
+            self.dp_attachment.sample_rate,
+        )
         steps_now = self._get_executed_dp_steps()
         if (
             self._cached_prospective_next_step is not None
@@ -559,8 +739,12 @@ class FLClient(fl.client.NumPyClient):
         local_epochs: int,
         round_number: Optional[int] = None,
     ) -> None:
-        if local_epochs <= 0:
-            raise ValueError(f"local_epochs must be positive, got {local_epochs}.")
+        validate_local_epochs(local_epochs)
+        if self.dp_attachment is not None:
+            validate_accountant_sample_rate(
+                self.dp_config.accountant,
+                self.dp_attachment.sample_rate,
+            )
 
         if self.dp_attachment is None or not self.dp_attachment.calibrated_from_target:
             return
@@ -626,32 +810,48 @@ class FLClient(fl.client.NumPyClient):
         if self.model.net is None:
             raise RuntimeError(f"Client {self.client_id} model network is not initialized.")
 
+        local_epochs = validate_local_epochs(local_epochs)
+        lr = validate_learning_rate(lr)
+        weight_decay = validate_weight_decay(weight_decay)
+
+        if self.optimizer is None:
+            self.optimizer = self._build_base_optimizer(
+                self.model.net.parameters(),
+                lr=lr,
+                weight_decay=weight_decay,
+            )
+
+        for group in self.optimizer.param_groups:
+            group["lr"] = lr
+            group["weight_decay"] = weight_decay
+
+        if self.reset_optimizer_each_round:
+            self.optimizer.state.clear()
+
         # Ensure train mode (activates Dropout layers if present)
         self.model.net.train()
-        optimizer = self._build_base_optimizer(
-            self.model.net.parameters(),
-            lr=lr,
-            weight_decay=weight_decay,
-        )
         criterion = nn.BCEWithLogitsLoss()
 
         total_loss = 0.0
         total_batches = 0
 
-        for epoch in range(local_epochs):
-            for batch_X, batch_y in self.train_loader:
-                optimizer.zero_grad()
-                logits = self.model.net(batch_X).squeeze(-1)
-                loss = criterion(logits, batch_y)
+        try:
+            for epoch in range(local_epochs):
+                for batch_X, batch_y in self.train_loader:
+                    self.optimizer.zero_grad()
+                    logits = self.model.net(batch_X).squeeze(-1)
+                    loss = criterion(logits, batch_y)
 
-                if torch.isnan(loss) or torch.isinf(loss):
-                    raise ValueError(f"Encountered non-finite loss {loss.item()} on client {self.client_id} at epoch {epoch}")
+                    if torch.isnan(loss) or torch.isinf(loss):
+                        raise ValueError(f"Encountered non-finite loss {loss.item()} on client {self.client_id} at epoch {epoch}")
 
-                loss.backward()
-                optimizer.step()
+                    loss.backward()
+                    self.optimizer.step()
 
-                total_loss += loss.item()
-                total_batches += 1
+                    total_loss += loss.item()
+                    total_batches += 1
+        finally:
+            self.optimizer.zero_grad(set_to_none=True)
 
         self.rounds_executed += 1
         avg_loss = total_loss / max(total_batches, 1)
@@ -671,6 +871,15 @@ class FLClient(fl.client.NumPyClient):
             or self.dp_attachment is None
         ):
             raise RuntimeError(f"Client {self.client_id} DP components are not initialized.")
+
+        validate_accountant_sample_rate(
+            self.dp_config.accountant,
+            self.dp_attachment.sample_rate,
+        )
+
+        local_epochs = validate_local_epochs(local_epochs)
+        lr = validate_learning_rate(lr)
+        weight_decay = validate_weight_decay(weight_decay)
 
         self._fit_attempt_counter += 1
         effective_round = (
@@ -836,11 +1045,23 @@ class FLClient(fl.client.NumPyClient):
         Tuple[List[np.ndarray], int, Dict[str, Scalar]]:
             Updated parameters, sample count, and dictionary of local training metrics.
         """
+        raw_local_epochs = config.get("local_epochs", self.planned_local_epochs)
+        local_epochs = validate_local_epochs(raw_local_epochs)
+
+        raw_lr = config.get("lr", self.default_lr)
+        lr = validate_learning_rate(raw_lr)
+
+        raw_weight_decay = config.get("weight_decay", self.default_weight_decay)
+        weight_decay = validate_weight_decay(raw_weight_decay)
+
+        if self.dp_enabled and self.dp_attachment is not None:
+            validate_accountant_sample_rate(
+                self.dp_config.accountant,
+                self.dp_attachment.sample_rate,
+            )
+
         self.model.set_parameters(parameters)
 
-        local_epochs = int(config.get("local_epochs", self.planned_local_epochs))
-        lr = float(config.get("lr", self.default_lr))
-        weight_decay = float(config.get("weight_decay", self.default_weight_decay))
         raw_round = config.get("server_round")
         round_number = int(raw_round) if raw_round is not None else None
 

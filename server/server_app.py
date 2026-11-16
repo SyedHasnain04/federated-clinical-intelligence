@@ -5,7 +5,9 @@ differentially private FedAvg over five simulated client partitions without Ray.
 """
 
 import logging
+import math
 import os
+import timeit
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
@@ -31,13 +33,15 @@ from flwr.common import (
 )
 from flwr.server.client_manager import SimpleClientManager
 from flwr.server.client_proxy import ClientProxy
+from flwr.server.history import History
 from flwr.server.server import Server
-from flwr.server.strategy import FedAvg
+from flwr.server.strategy import FedAvg, Strategy
 
 from client.client_app import FLClient, validate_optimizer_config
 from data.mock_schema import generate_mock_data
 from data.partition import partition_clients
 from data.split import patient_level_split
+from eval.clinical_metrics import compute_metrics
 from eval.communication_cost import CommunicationCostTracker
 from eval.privacy_ledger import (
     CumulativePrivacyLedger,
@@ -45,10 +49,15 @@ from eval.privacy_ledger import (
     classify_budget_status,
 )
 from models.baseline import (
+    CANONICAL_FEATURES,
+    CANONICAL_FEATURE_DIM,
     BaseModel,
     LogisticRegressionModel,
     MLPModel,
     TabularPreprocessor,
+    validate_batch_size,
+    validate_binary_labels,
+    validate_canonical_features,
 )
 from privacy.dp_wrapper import DPConfig
 
@@ -240,21 +249,42 @@ class ClientProxyRegistry:
 def aggregate_weighted_metrics(
     metrics: List[Tuple[int, Dict[str, Scalar]]],
 ) -> Dict[str, Scalar]:
-    """Computes sample-weighted average of numeric client metrics."""
+    """Computes sample-weighted average of numeric client metrics.
+
+    Maintains an independent sample-count denominator for each metric, correctly
+    handling missing metric keys across clients, ignoring non-numeric, boolean,
+    and non-finite (NaN/Inf) values, and ignoring clients with non-positive or
+    boolean sample counts.
+    """
     if not metrics:
         return {}
 
-    total_samples = sum(num_samples for num_samples, _ in metrics)
-    if total_samples == 0:
-        return {}
+    metric_weighted_sums: Dict[str, float] = {}
+    metric_sample_counts: Dict[str, int] = {}
 
-    aggregated: Dict[str, float] = {}
-    for num_samples, m_dict in metrics:
+    for item in metrics:
+        if not isinstance(item, tuple) or len(item) != 2:
+            continue
+        num_samples, m_dict = item
+        if isinstance(num_samples, bool) or not isinstance(num_samples, int) or num_samples <= 0:
+            continue
+        if not isinstance(m_dict, dict) or not m_dict:
+            continue
+
         for key, val in m_dict.items():
-            if not isinstance(val, bool) and isinstance(val, (int, float)):
-                aggregated[key] = aggregated.get(key, 0.0) + float(val) * num_samples
+            if isinstance(val, bool) or not isinstance(val, (int, float)):
+                continue
+            val_f = float(val)
+            if not math.isfinite(val_f):
+                continue
+            metric_weighted_sums[key] = metric_weighted_sums.get(key, 0.0) + val_f * num_samples
+            metric_sample_counts[key] = metric_sample_counts.get(key, 0) + num_samples
 
-    return {k: v / total_samples for k, v in aggregated.items()}
+    return {
+        key: metric_weighted_sums[key] / metric_sample_counts[key]
+        for key in metric_weighted_sums
+        if metric_sample_counts.get(key, 0) > 0
+    }
 
 
 def aggregate_fit_metrics(
@@ -603,12 +633,134 @@ def collect_federation_privacy_summary(
     }
 
 
+def _validate_num_clients(num_clients: Any) -> int:
+    """Validates that exactly 5 simulated clients (care-unit partitions) are configured."""
+    if isinstance(num_clients, bool) or not isinstance(num_clients, int) or num_clients != 5:
+        raise ValueError(
+            f"This experiment requires exactly 5 simulated clients (care-unit partitions), "
+            f"got {num_clients!r}."
+        )
+    return 5
+
+
+def _verify_checkpoint_parameters(
+    expected_parameters: List[np.ndarray],
+    reloaded_parameters: List[np.ndarray],
+    rtol: float = 1e-5,
+    atol: float = 1e-5,
+) -> None:
+    """Verifies that reloaded checkpoint parameters match expected parameters.
+
+    Checks:
+    1. Expected and reloaded parameter counts match.
+    2. Shapes of corresponding parameter arrays match identically.
+    3. All values in expected and reloaded arrays are finite numeric values (no NaN or Inf).
+    4. Numerical values match within the specified tolerances (rtol, atol).
+
+    Raises:
+        ValueError: If any check fails, indicating the parameter index or mismatch reason.
+    """
+    if len(expected_parameters) != len(reloaded_parameters):
+        raise ValueError(
+            f"Checkpoint parameter count mismatch: expected {len(expected_parameters)} "
+            f"arrays, but reloaded checkpoint has {len(reloaded_parameters)} arrays."
+        )
+
+    for idx, (p_exp, p_act) in enumerate(zip(expected_parameters, reloaded_parameters)):
+        p_exp_arr = np.asarray(p_exp)
+        p_act_arr = np.asarray(p_act)
+
+        if p_exp_arr.shape != p_act_arr.shape:
+            raise ValueError(
+                f"Checkpoint parameter shape mismatch at index {idx}: expected shape "
+                f"{p_exp_arr.shape}, but reloaded array has shape {p_act_arr.shape}."
+            )
+
+        if not np.issubdtype(p_exp_arr.dtype, np.number) or not np.all(np.isfinite(p_exp_arr)):
+            raise ValueError(
+                f"Expected parameter array at index {idx} contains non-finite or non-numeric values."
+            )
+
+        if not np.issubdtype(p_act_arr.dtype, np.number) or not np.all(np.isfinite(p_act_arr)):
+            raise ValueError(
+                f"Reloaded checkpoint parameter array at index {idx} contains non-finite or non-numeric values."
+            )
+
+        if not np.allclose(p_act_arr, p_exp_arr, rtol=rtol, atol=atol):
+            max_diff = float(np.max(np.abs(p_act_arr - p_exp_arr)))
+            raise ValueError(
+                f"Checkpoint parameter value mismatch at index {idx}: maximum absolute difference "
+                f"{max_diff:.6e} exceeds rtol={rtol} and atol={atol}."
+            )
+
+
+
 def _build_baseline_model(model_type: str, input_dim: int) -> BaseModel:
+    if input_dim != CANONICAL_FEATURE_DIM:
+        raise ValueError(
+            f"Invalid input_dim {input_dim}: baseline model requires exactly {CANONICAL_FEATURE_DIM} canonical features."
+        )
     if model_type == "logistic_regression":
-        return LogisticRegressionModel(input_dim=input_dim)
+        return LogisticRegressionModel(input_dim=CANONICAL_FEATURE_DIM)
     if model_type == "mlp":
-        return MLPModel(input_dim=input_dim, hidden_dims=(64, 32), dropout=0.2)
+        return MLPModel(input_dim=CANONICAL_FEATURE_DIM, hidden_dims=(64, 32), dropout=0.2)
     raise ValueError(f"Unknown model_type: '{model_type}'")
+
+
+def validate_server_preprocessor(
+    preprocessor: Any,
+    train_df: Optional[pd.DataFrame] = None,
+) -> TabularPreprocessor:
+    """Validates that the server's shared preprocessor exists, is fitted, and matches canonical schema.
+
+    Parameters
+    ----------
+    preprocessor : Any
+        Preprocessor instance to validate.
+    train_df : Optional[pd.DataFrame], optional
+        Training DataFrame to transform and verify transformed width == 51.
+
+    Returns
+    -------
+    TabularPreprocessor
+        Validated preprocessor.
+
+    Raises
+    ------
+    TypeError
+        If preprocessor is None or not a TabularPreprocessor instance.
+    RuntimeError
+        If preprocessor has not been fit.
+    ValueError
+        If feature_cols != CANONICAL_FEATURES or transformed width != 51.
+    """
+    if preprocessor is None:
+        raise TypeError("Server shared preprocessor must not be None; a fitted TabularPreprocessor is required.")
+
+    if not isinstance(preprocessor, TabularPreprocessor):
+        raise TypeError(
+            f"Server shared preprocessor must be a TabularPreprocessor instance, got {type(preprocessor).__name__}."
+        )
+
+    if (
+        preprocessor.medians_ is None
+        or preprocessor.means_ is None
+        or preprocessor.stds_ is None
+        or preprocessor.feature_cols is None
+    ):
+        raise RuntimeError("Server shared preprocessor has not been fit.")
+
+    validate_canonical_features(preprocessor.feature_cols)
+
+    if train_df is not None:
+        X_train, _ = preprocessor.transform(train_df)
+        if X_train.shape[1] != CANONICAL_FEATURE_DIM:
+            raise ValueError(
+                f"Server transformed training matrix width {X_train.shape[1]} "
+                f"does not match expected canonical feature dimension {CANONICAL_FEATURE_DIM}."
+            )
+
+    return preprocessor
 
 
 def get_fedavg_strategy(
@@ -647,6 +799,761 @@ def get_fedavg_strategy(
     return FedAvg(**common_kwargs)
 
 
+class FederatedSession:
+    """Stateful Flower federated learning session supporting stepwise round execution.
+
+    Wraps an existing Flower ``Server`` (and its ``Strategy`` and ``ClientManager``)
+    to execute one round at a time via ``step_round()`` while preserving global
+    ``server.parameters``, Flower ``History``, round numbering, and Phase 2
+    fit/evaluation semantics identically to ``Server.fit()``.
+    """
+
+    def __init__(
+        self,
+        server: Server,
+        *,
+        timeout: Optional[float] = None,
+        planned_rounds: Optional[int] = None,
+        seed: Optional[int] = None,
+        _simulation_context: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if server is None or not (
+            hasattr(server, "strategy")
+            and hasattr(server, "fit_round")
+            and hasattr(server, "evaluate_round")
+            and hasattr(server, "_get_initial_parameters")
+        ):
+            raise TypeError(
+                "server must be a Flower Server (or compatible object with strategy, "
+                "fit_round, evaluate_round, and _get_initial_parameters)."
+            )
+        if timeout is not None:
+            if (
+                isinstance(timeout, bool)
+                or not isinstance(timeout, (int, float))
+                or not np.isfinite(float(timeout))
+                or float(timeout) < 0.0
+            ):
+                raise ValueError(f"timeout must be non-negative finite float or None, got {timeout!r}.")
+        if planned_rounds is not None:
+            if (
+                isinstance(planned_rounds, bool)
+                or not isinstance(planned_rounds, int)
+                or planned_rounds <= 0
+            ):
+                raise ValueError(
+                    f"planned_rounds must be a positive integer or None, got {planned_rounds!r}."
+                )
+
+        self.server = server
+        self.timeout: Optional[float] = float(timeout) if timeout is not None else None
+        self.planned_rounds: Optional[int] = int(planned_rounds) if planned_rounds is not None else None
+        self.seed: Optional[int] = int(seed) if seed is not None else None
+        self.history: History = History()
+        self.current_round: int = 0
+        self.initialized: bool = False
+        self.elapsed_seconds: float = 0.0
+        self.round_history: List[Dict[str, Any]] = []
+        self._simulation_context: Optional[Dict[str, Any]] = (
+            dict(_simulation_context) if _simulation_context is not None else None
+        )
+
+    @property
+    def strategy(self) -> Strategy:
+        """Returns the active Flower strategy managed by the underlying Server."""
+        return self.server.strategy
+
+    @property
+    def parameters(self) -> Parameters:
+        """Returns the current global Flower Parameters held by the Server."""
+        return self.server.parameters
+
+    def initialize(self) -> Parameters:
+        """Initializes round-0 global parameters and records round-0 centralized eval."""
+        if self.initialized:
+            return self.server.parameters
+
+        self.server.parameters = self.server._get_initial_parameters(
+            server_round=0,
+            timeout=self.timeout,
+        )
+        res_cen = self.server.strategy.evaluate(0, parameters=self.server.parameters)
+        if res_cen is not None:
+            loss_cen, metrics_cen = res_cen
+            self.history.add_loss_centralized(server_round=0, loss=loss_cen)
+            self.history.add_metrics_centralized(server_round=0, metrics=metrics_cen)
+
+        # Match Phase 2 Server.fit() RNG seeding immediately prior to Round 1
+        if self.seed is not None:
+            torch.manual_seed(self.seed)
+
+        self.initialized = True
+        self._log_initialization()
+        return self.server.parameters
+
+    def _log_initialization(self) -> None:
+        """Emits one structured, privacy-preserving configuration log record."""
+        ctx = self._simulation_context or {}
+        dp_cfg: Optional[DPConfig] = ctx.get("dp_config")
+        dp_enabled = bool(dp_cfg.dp_enabled) if dp_cfg is not None else False
+        if dp_enabled:
+            privacy_condition = (
+                f"dp_epsilon_{dp_cfg.epsilon_target}"
+                if getattr(dp_cfg, "epsilon_target", None) is not None
+                else "dp_enabled"
+            )
+        else:
+            privacy_condition = "non_private"
+
+        clients: List[Any] = ctx.get("clients", [])
+        train_samples = ctx.get("train_sample_count")
+        if train_samples is None and clients:
+            train_samples = sum(getattr(c, "num_train_samples", 0) for c in clients)
+
+        val_df = ctx.get("val_df")
+        val_samples = ctx.get("val_sample_count")
+        if val_samples is None and val_df is not None:
+            val_samples = len(val_df)
+
+        test_df = ctx.get("test_df")
+        test_samples = ctx.get("test_sample_count")
+        if test_samples is None and test_df is not None:
+            test_samples = len(test_df)
+
+        seed = self.seed
+        model_type = ctx.get("model_type")
+        num_clients = ctx.get("num_clients", len(clients) if clients else None)
+        num_rounds = ctx.get("num_rounds", self.planned_rounds)
+        local_epochs = ctx.get("local_epochs")
+        if local_epochs is None and clients:
+            local_epochs = getattr(clients[0], "local_epochs", None)
+
+        learning_rate = ctx.get("learning_rate", ctx.get("lr"))
+        if learning_rate is None and clients:
+            learning_rate = getattr(clients[0], "lr", None)
+
+        batch_size = ctx.get("batch_size")
+        if batch_size is None and clients:
+            batch_size = getattr(clients[0], "batch_size", None)
+
+        weight_decay = ctx.get("weight_decay")
+        if weight_decay is None and clients:
+            weight_decay = getattr(clients[0], "weight_decay", None)
+
+        max_workers = ctx.get("max_workers", getattr(self.server, "max_workers", None))
+
+        logger.info(
+            "FederatedSession initialized: seed=%s, model_type=%s, num_clients=%s, num_rounds=%s, "
+            "local_epochs=%s, learning_rate=%s, batch_size=%s, weight_decay=%s, max_workers=%s, "
+            "train_samples=%s, val_samples=%s, test_samples=%s, dp_mode=%s",
+            seed,
+            model_type,
+            num_clients,
+            num_rounds,
+            local_epochs,
+            learning_rate,
+            batch_size,
+            weight_decay,
+            max_workers,
+            train_samples,
+            val_samples,
+            test_samples,
+            privacy_condition,
+            extra={
+                "event": "session_initialized",
+                "seed": seed,
+                "model_type": model_type,
+                "num_clients": num_clients,
+                "num_rounds": num_rounds,
+                "local_epochs": local_epochs,
+                "learning_rate": learning_rate,
+                "batch_size": batch_size,
+                "weight_decay": weight_decay,
+                "max_workers": max_workers,
+                "train_sample_count": train_samples,
+                "val_sample_count": val_samples,
+                "test_sample_count": test_samples,
+                "dp_enabled": dp_enabled,
+                "dp_mode": privacy_condition,
+                "privacy_condition": privacy_condition,
+            },
+        )
+
+    def _log_finalization(
+        self,
+        checkpoint_path: Optional[str],
+        dp_summary: Dict[str, Any],
+        comm_bytes: Optional[int],
+    ) -> None:
+        """Emits one structured, privacy-preserving completion log record."""
+        ctx = self._simulation_context or {}
+        dp_cfg: Optional[DPConfig] = ctx.get("dp_config")
+        dp_enabled = bool(dp_cfg.dp_enabled) if dp_cfg is not None else False
+
+        status = "completed"
+        completed_rounds = self.current_round
+        elapsed_time = self.elapsed_seconds
+
+        if dp_enabled:
+            final_epsilon = dp_summary.get("global_epsilon_realized")
+            dp_status = "dp_enabled"
+        else:
+            final_epsilon = None
+            dp_status = "dp_disabled"
+
+        ckpt_path = str(checkpoint_path) if checkpoint_path is not None else None
+
+        logger.info(
+            "FederatedSession finalized: status=%s, completed_rounds=%s, elapsed_time=%.4fs, "
+            "final_epsilon=%s, communication_bytes=%s, checkpoint_path=%s, dp_status=%s",
+            status,
+            completed_rounds,
+            elapsed_time,
+            f"{final_epsilon:.4f}" if final_epsilon is not None else "None",
+            comm_bytes,
+            ckpt_path,
+            dp_status,
+            extra={
+                "event": "session_finalized",
+                "status": status,
+                "completed_rounds": completed_rounds,
+                "elapsed_time": elapsed_time,
+                "final_epsilon": final_epsilon,
+                "communication_bytes": comm_bytes,
+                "checkpoint_path": ckpt_path,
+                "dp_enabled": dp_enabled,
+                "dp_status": dp_status,
+            },
+        )
+
+    def step_round(self) -> Dict[str, Any]:
+        """Executes exactly one federated round (fit -> centralized eval -> distributed eval)."""
+        if not self.initialized:
+            self.initialize()
+
+        next_round = self.current_round + 1
+        round_start = timeit.default_timer()
+
+        # 1. Fit round (configure_fit -> fit_clients -> aggregate_fit)
+        res_fit = self.server.fit_round(
+            server_round=next_round,
+            timeout=self.timeout,
+        )
+        fit_metrics: Dict[str, Scalar] = {}
+        fit_results_and_failures: Optional[Tuple[List[Any], List[Any]]] = None
+        parameters_updated = False
+        if res_fit is not None:
+            parameters_prime, fit_metrics, fit_results_and_failures = res_fit
+            if parameters_prime:
+                self.server.parameters = parameters_prime
+                parameters_updated = True
+            self.history.add_metrics_distributed_fit(
+                server_round=next_round,
+                metrics=fit_metrics,
+            )
+
+        # 2. Centralized strategy evaluation (matches Server.fit)
+        res_cen = self.server.strategy.evaluate(next_round, parameters=self.server.parameters)
+        centralized_loss: Optional[float] = None
+        centralized_metrics: Dict[str, Scalar] = {}
+        if res_cen is not None:
+            centralized_loss, centralized_metrics = res_cen
+            self.history.add_loss_centralized(server_round=next_round, loss=centralized_loss)
+            self.history.add_metrics_centralized(
+                server_round=next_round,
+                metrics=centralized_metrics,
+            )
+
+        # 3. Distributed client evaluation (configure_evaluate -> evaluate_clients -> aggregate_evaluate)
+        res_fed = self.server.evaluate_round(
+            server_round=next_round,
+            timeout=self.timeout,
+        )
+        distributed_loss: Optional[float] = None
+        distributed_metrics: Dict[str, Scalar] = {}
+        eval_results_and_failures: Optional[Tuple[List[Any], List[Any]]] = None
+        if res_fed is not None:
+            distributed_loss, distributed_metrics, eval_results_and_failures = res_fed
+            if distributed_loss is not None:
+                self.history.add_loss_distributed(
+                    server_round=next_round,
+                    loss=distributed_loss,
+                )
+                self.history.add_metrics_distributed(
+                    server_round=next_round,
+                    metrics=distributed_metrics,
+                )
+
+        round_elapsed = timeit.default_timer() - round_start
+        self.elapsed_seconds += round_elapsed
+        self.current_round = next_round
+
+        fit_results, fit_failures = (
+            fit_results_and_failures if fit_results_and_failures is not None else ([], [])
+        )
+        eval_results, eval_failures = (
+            eval_results_and_failures if eval_results_and_failures is not None else ([], [])
+        )
+
+        round_summary: Dict[str, Any] = {
+            "round_number": next_round,
+            "parameters_updated": parameters_updated,
+            "fit_executed": res_fit is not None,
+            "fit_metrics": dict(fit_metrics),
+            "fit_num_results": len(fit_results),
+            "fit_num_failures": len(fit_failures),
+            "centralized_loss": centralized_loss,
+            "centralized_metrics": dict(centralized_metrics),
+            "evaluate_executed": res_fed is not None,
+            "distributed_loss": distributed_loss,
+            "distributed_metrics": dict(distributed_metrics),
+            "evaluate_num_results": len(eval_results),
+            "evaluate_num_failures": len(eval_failures),
+            "elapsed_seconds": round_elapsed,
+        }
+        self.round_history.append(round_summary)
+        return round_summary
+
+    def run_rounds(self, num_rounds: int) -> List[Dict[str, Any]]:
+        """Executes ``num_rounds`` sequential rounds via ``step_round()``."""
+        if isinstance(num_rounds, bool) or not isinstance(num_rounds, int) or num_rounds <= 0:
+            raise ValueError(f"num_rounds must be a positive integer, got {num_rounds!r}.")
+
+        summaries: List[Dict[str, Any]] = []
+        for _ in range(num_rounds):
+            summaries.append(self.step_round())
+        return summaries
+
+    @classmethod
+    def from_simulation(
+        cls,
+        num_rounds: int = 2,
+        num_clients: int = 5,
+        model_type: str = "logistic_regression",
+        seed: int = 42,
+        max_workers: Optional[int] = None,
+        local_epochs: int = 3,
+        lr: float = 1e-3,
+        batch_size: int = 32,
+        n_stays: int = 3000,
+        dp_config: Optional[DPConfig] = None,
+        weight_decay: float = 1e-4,
+        reset_optimizer_each_round: bool = True,
+        epsilon_budget: Optional[float] = None,
+        budget_check_mode: str = "step",
+        planned_rounds: Optional[int] = None,
+        proxy_id_fn: Optional[Callable[[int], str]] = None,
+        round_metadata: Optional[Dict[int, Dict[str, Any]]] = None,
+        experiment_id: Optional[str] = None,
+        optimizer_type: str = "adam",
+        momentum: float = 0.0,
+        timeout: Optional[float] = None,
+        preprocessor: Optional[TabularPreprocessor] = None,
+    ) -> "FederatedSession":
+        """Constructs a configured 5-client synthetic FederatedSession matching Phase 2 setup."""
+        _validate_num_clients(num_clients)
+        validated_batch_size = validate_batch_size(batch_size)
+        if dp_config is not None and not isinstance(dp_config, DPConfig):
+            raise TypeError(f"dp_config must be a DPConfig or None, got {type(dp_config).__name__}.")
+        if isinstance(num_rounds, bool) or not isinstance(num_rounds, int) or num_rounds <= 0:
+            raise ValueError(f"num_rounds must be a positive integer, got {num_rounds!r}.")
+        if isinstance(local_epochs, bool) or not isinstance(local_epochs, int) or local_epochs <= 0:
+            raise ValueError(f"local_epochs must be a positive integer, got {local_epochs!r}.")
+        normalized_optimizer_type, validated_momentum = validate_optimizer_config(
+            optimizer_type=optimizer_type,
+            momentum=momentum,
+        )
+
+        effective_planned_rounds = num_rounds if planned_rounds is None else planned_rounds
+        if (
+            isinstance(effective_planned_rounds, bool)
+            or not isinstance(effective_planned_rounds, int)
+            or effective_planned_rounds <= 0
+        ):
+            raise ValueError(
+                f"planned_rounds must be a positive integer, got {planned_rounds!r}."
+            )
+
+        effective_dp_config = dp_config if dp_config is not None else DPConfig(dp_enabled=False)
+        effective_proxy_id_fn = (
+            proxy_id_fn if proxy_id_fn is not None else (lambda cid: f"careunit-proxy-{cid}")
+        )
+
+        logger.info(
+            "Initializing synthetic cohort and client partitions (seed=%s, dp_enabled=%s)...",
+            seed,
+            effective_dp_config.dp_enabled,
+        )
+
+        # 1. Build synthetic cohort and patient-level split (zero disk side-effects)
+        df = generate_mock_data(n_stays=n_stays, seed=seed)
+        train_df, val_df, test_df = patient_level_split(
+            df,
+            seed=seed,
+            frac=(0.7, 0.15, 0.15),
+            splits_dir="",
+        )
+
+        train_subjects = set(train_df["subject_id"])
+        val_subjects = set(val_df["subject_id"])
+        test_subjects = set(test_df["subject_id"])
+        if (
+            (train_subjects & val_subjects)
+            or (train_subjects & test_subjects)
+            or (val_subjects & test_subjects)
+        ):
+            raise RuntimeError(
+                "Patient-level split leakage detected across train_df, val_df, and test_df."
+            )
+
+        # 2. Fit shared preprocessor ONCE on the full global training split ONLY
+        #    (strictly zero leakage from val_df or test_df; outside DP-SGD guarantee)
+        if preprocessor is None:
+            shared_preprocessor = TabularPreprocessor()
+            shared_preprocessor.fit(train_df)
+        else:
+            shared_preprocessor = preprocessor
+
+        validate_server_preprocessor(shared_preprocessor, train_df=train_df)
+
+        # 3. Partition both train and val into disjoint subsets matching careunits
+        train_partitions = partition_clients(
+            train_df,
+            num_clients=num_clients,
+            strategy="natural",
+            seed=seed,
+            output_dir="",
+            report_path="",
+        )
+        val_partitions = partition_clients(
+            val_df,
+            num_clients=num_clients,
+            strategy="natural",
+            seed=seed,
+            output_dir="",
+            report_path="",
+        )
+
+        # 4. Guard against empty partitions and verify cross-partition subject isolation
+        seen_train_subjects: set[Any] = set()
+        seen_val_subjects: set[Any] = set()
+        for cid in range(num_clients):
+            if cid not in train_partitions or len(train_partitions[cid]) == 0:
+                raise ValueError(f"Client {cid} training partition is empty. Cannot execute FedAvg.")
+            if cid not in val_partitions or len(val_partitions[cid]) == 0:
+                raise ValueError(f"Client {cid} validation partition is empty. Cannot execute FedAvg.")
+
+            c_train_subjects = set(train_partitions[cid]["subject_id"])
+            c_val_subjects = set(val_partitions[cid]["subject_id"])
+            if seen_train_subjects & c_train_subjects:
+                raise RuntimeError(f"Duplicate subject_id detected in train_partitions[{cid}].")
+            if seen_val_subjects & c_val_subjects:
+                raise RuntimeError(f"Duplicate subject_id detected in val_partitions[{cid}].")
+            seen_train_subjects.update(c_train_subjects)
+            seen_val_subjects.update(c_val_subjects)
+
+        if seen_train_subjects != train_subjects:
+            raise RuntimeError("train_partitions subject set does not match train_df.")
+        if seen_val_subjects != val_subjects:
+            raise RuntimeError("val_partitions subject set does not match val_df.")
+        if (seen_train_subjects & seen_val_subjects) or (seen_val_subjects & test_subjects):
+            raise RuntimeError("Subject-level isolation violated across partitioned splits.")
+
+        # 5. Instantiate independent FLClient objects, explicit proxy mapping, and comm tracker
+        client_manager = SimpleClientManager()
+        registry = ClientProxyRegistry()
+        comm_tracker = CommunicationCostTracker(num_clients=num_clients)
+        clients: List[FLClient] = []
+
+        for cid in range(num_clients):
+            fl_client = FLClient(
+                client_id=cid,
+                train_df=train_partitions[cid],
+                val_df=val_partitions[cid],
+                model_type=model_type,
+                batch_size=validated_batch_size,
+                base_seed=seed,
+                preprocessor=shared_preprocessor,
+                dp_config=effective_dp_config,
+                planned_rounds=effective_planned_rounds,
+                local_epochs=local_epochs,
+                lr=lr,
+                weight_decay=weight_decay,
+                reset_optimizer_each_round=reset_optimizer_each_round,
+                epsilon_budget=epsilon_budget,
+                budget_check_mode=budget_check_mode,
+                optimizer_type=normalized_optimizer_type,
+                momentum=validated_momentum,
+                require_preprocessor=True,
+            )
+            clients.append(fl_client)
+            wrapped_client = fl_client.to_client()
+            proxy_cid = str(effective_proxy_id_fn(cid))
+            proxy = LocalClientProxy(
+                cid=proxy_cid,
+                client=wrapped_client,
+                hospital_client_id=cid,
+                comm_tracker=comm_tracker,
+            )
+            registry.register(proxy, fl_client)
+            client_manager.register(proxy)
+
+        if effective_dp_config.dp_enabled:
+            if epsilon_budget is not None:
+                ledger_budget: Optional[float] = float(epsilon_budget)
+            elif effective_dp_config.noise_multiplier is None:
+                ledger_budget = float(effective_dp_config.epsilon_target)
+            else:
+                ledger_budget = None
+        else:
+            ledger_budget = None
+
+        ledger = CumulativePrivacyLedger(
+            num_clients=num_clients,
+            dp_enabled=effective_dp_config.dp_enabled,
+            epsilon_budget=ledger_budget,
+            delta=effective_dp_config.delta if effective_dp_config.dp_enabled else None,
+            accountant=effective_dp_config.accountant if effective_dp_config.dp_enabled else None,
+            privacy_unit=effective_dp_config.privacy_unit,
+            adjacency=effective_dp_config.adjacency,
+            preprocessing_covered_by_dp=False,
+        )
+
+        # 6. Extract initial parameters from an independent reference model with fixed seed
+        torch.manual_seed(seed)
+        X_train_transformed, _ = shared_preprocessor.transform(train_df)
+        transformed_width = X_train_transformed.shape[1]
+        if transformed_width != CANONICAL_FEATURE_DIM:
+            raise ValueError(
+                f"Server transformed training matrix has {transformed_width} columns; "
+                f"expected exactly {CANONICAL_FEATURE_DIM} canonical features."
+            )
+        input_dim = CANONICAL_FEATURE_DIM
+        ref_model = _build_baseline_model(model_type=model_type, input_dim=input_dim)
+
+        initial_parameters_list = ref_model.get_parameters()
+        initial_parameters = ndarrays_to_parameters(initial_parameters_list)
+
+        # 7. Fit configuration hook aligned with client calibration schedule
+        def fit_config_fn(server_round: int) -> Dict[str, Scalar]:
+            return {
+                "local_epochs": local_epochs,
+                "lr": lr,
+                "weight_decay": weight_decay,
+                "server_round": server_round,
+            }
+
+        # 8. Configure PrivacyAwareFedAvg strategy and Server instance
+        strategy = get_fedavg_strategy(
+            initial_parameters=initial_parameters,
+            min_clients=num_clients,
+            on_fit_config_fn=fit_config_fn,
+            registry=registry,
+            ledger=ledger,
+            dp_config=effective_dp_config,
+            comm_tracker=comm_tracker,
+            round_metadata=round_metadata,
+        )
+
+        server = Server(client_manager=client_manager, strategy=strategy)
+        if max_workers is not None:
+            server.max_workers = max_workers
+
+        sim_context: Dict[str, Any] = {
+            "clients": clients,
+            "registry": registry,
+            "ledger": ledger,
+            "comm_tracker": comm_tracker,
+            "preprocessor": shared_preprocessor,
+            "train_df": train_df,
+            "val_df": val_df,
+            "val_partitions": val_partitions,
+            "test_df": test_df,
+            "initial_parameters_list": initial_parameters_list,
+            "dp_config": effective_dp_config,
+            "model_type": model_type,
+            "input_dim": input_dim,
+            "num_clients": num_clients,
+            "experiment_id": experiment_id,
+            "num_rounds": num_rounds,
+            "local_epochs": local_epochs,
+            "learning_rate": lr,
+            "lr": lr,
+            "batch_size": validated_batch_size,
+            "weight_decay": weight_decay,
+            "max_workers": max_workers,
+            "train_sample_count": len(train_df),
+            "val_sample_count": len(val_df),
+            "test_sample_count": len(test_df),
+        }
+
+        return cls(
+            server=server,
+            timeout=timeout,
+            planned_rounds=effective_planned_rounds,
+            seed=seed,
+            _simulation_context=sim_context,
+        )
+
+    def finalize(
+        self,
+        checkpoint_path: Optional[str] = None,
+        evaluate_test: bool = False,
+    ) -> Dict[str, Any]:
+        """Collects verified privacy, model, checkpoint, and communication outputs."""
+        if not isinstance(evaluate_test, bool):
+            raise TypeError(f"evaluate_test must be a bool, got {type(evaluate_test).__name__}.")
+        if self._simulation_context is None:
+            raise RuntimeError(
+                "FederatedSession.finalize() requires a simulation session created via "
+                "FederatedSession.from_simulation()."
+            )
+        if self.current_round <= 0:
+            raise RuntimeError(
+                "Cannot finalize FederatedSession before executing at least one round."
+            )
+
+        ctx = self._simulation_context
+        clients: List[FLClient] = ctx["clients"]
+        registry: ClientProxyRegistry = ctx["registry"]
+        ledger: CumulativePrivacyLedger = ctx["ledger"]
+        comm_tracker: CommunicationCostTracker = ctx["comm_tracker"]
+        shared_preprocessor: TabularPreprocessor = ctx["preprocessor"]
+        val_df: pd.DataFrame = ctx["val_df"]
+        val_partitions: Dict[int, pd.DataFrame] = ctx["val_partitions"]
+        test_df: pd.DataFrame = ctx["test_df"]
+        initial_parameters_list: List[np.ndarray] = ctx["initial_parameters_list"]
+        effective_dp_config: DPConfig = ctx["dp_config"]
+        model_type: str = ctx["model_type"]
+        input_dim: int = ctx["input_dim"]
+        num_clients: int = ctx["num_clients"]
+        experiment_id: Optional[str] = ctx["experiment_id"]
+
+        # Collect verified federation-level DP privacy summary (max across disjoint clients)
+        dp_summary = collect_federation_privacy_summary(
+            clients=clients,
+            dp_config=effective_dp_config,
+            expected_rounds=self.current_round,
+            expected_num_clients=num_clients,
+            ledger=ledger,
+            registry=registry,
+        )
+
+        # Retrieve and verify final aggregated global parameters
+        if self.server.parameters is None:
+            raise RuntimeError("Federated simulation ended without producing global server parameters.")
+
+        final_ndarrays = parameters_to_ndarrays(self.server.parameters)
+
+        # Load final weights into clean global model
+        global_model = _build_baseline_model(model_type=model_type, input_dim=input_dim)
+        global_model.set_parameters(final_ndarrays)
+
+        # Checkpoint persistence and verification
+        if checkpoint_path:
+            os.makedirs(os.path.dirname(checkpoint_path) or ".", exist_ok=True)
+            if global_model.net is None:
+                raise RuntimeError("Global model network is None; cannot save checkpoint.")
+
+            torch.save(global_model.net.state_dict(), checkpoint_path)
+
+            verify_model = _build_baseline_model(model_type=model_type, input_dim=input_dim)
+            if verify_model.net is None:
+                raise RuntimeError("Verification model network is None.")
+
+            verify_model.net.load_state_dict(torch.load(checkpoint_path, weights_only=True))
+            reloaded_ndarrays = verify_model.get_parameters()
+
+            _verify_checkpoint_parameters(
+                expected_parameters=final_ndarrays,
+                reloaded_parameters=reloaded_ndarrays,
+                rtol=1e-5,
+                atol=1e-5,
+            )
+
+        # Opt-in held-out test evaluation on the final global model
+        test_metrics: Optional[Dict[str, Any]] = None
+        if evaluate_test:
+            if test_df is None or len(test_df) == 0:
+                raise ValueError("test_df is empty or missing; cannot evaluate test set.")
+            if "in_hospital_mortality" not in test_df.columns:
+                raise ValueError("test_df lacks 'in_hospital_mortality' target column.")
+
+            # Transform held-out test split using the training-fitted preprocessor only
+            X_test, y_test = shared_preprocessor.transform(test_df)
+            if y_test is None:
+                raise ValueError("test_df target extraction failed.")
+
+            validated_y_test = validate_binary_labels(y_test, context="Test split 'in_hospital_mortality'")
+
+            # Run inference without gradient tracking on the final global model
+            raw_probs = global_model.predict_proba(X_test)
+            probs = np.asarray(raw_probs, dtype=np.float32).reshape(-1)
+            y_test_arr = np.asarray(validated_y_test, dtype=np.float32).reshape(-1)
+
+            if probs.shape != y_test_arr.shape:
+                raise ValueError(
+                    f"Shape mismatch: prediction shape {probs.shape} does not match label shape {y_test_arr.shape}"
+                )
+
+            criterion = torch.nn.BCELoss()
+            bce_loss = float(
+                criterion(
+                    torch.tensor(probs, dtype=torch.float32),
+                    torch.tensor(y_test_arr, dtype=torch.float32),
+                ).item()
+            )
+
+            test_metrics = compute_metrics(
+                y_true=y_test_arr,
+                y_pred_proba=probs,
+                threshold=0.5,
+            )
+            test_metrics["loss"] = round(bce_loss, 4)
+            test_metrics["test_df_used"] = True
+
+        comm_dict: Dict[str, Any] = {}
+        comm_bytes: Optional[int] = None
+        if comm_tracker is not None:
+            comm_dict = comm_tracker.to_registry_dict(
+                experiment_id=experiment_id,
+                seed=self.seed,
+            )
+            comm_bytes = comm_dict.get("total_bytes")
+
+        self._log_finalization(
+            checkpoint_path=checkpoint_path,
+            dp_summary=dp_summary,
+            comm_bytes=comm_bytes,
+        )
+
+        result: Dict[str, Any] = {
+            "history": self.history,
+            "elapsed": self.elapsed_seconds,
+            "final_parameters": final_ndarrays,
+            "initial_parameters": initial_parameters_list,
+            "global_model": global_model,
+            "clients": clients,
+            "preprocessor": shared_preprocessor,
+            "val_df": val_df.copy(),
+            "val_partitions": {cid: part_df.copy() for cid, part_df in val_partitions.items()},
+            "test_df": test_df,
+            "dp_summary": dp_summary,
+            "privacy_ledger": ledger,
+            "communication_cost": comm_dict,
+            "communication_tracker": comm_tracker,
+            "proxy_mapping": {
+                "proxy_to_client_id": dict(registry.proxy_to_client_id),
+                "client_id_to_proxy_id": dict(registry.client_id_to_proxy_id),
+            },
+        }
+
+        if test_metrics is not None:
+            result["test_metrics"] = test_metrics
+
+        return result
+
+
 def run_federated_simulation(
     num_rounds: int = 2,
     num_clients: int = 5,
@@ -669,6 +1576,7 @@ def run_federated_simulation(
     experiment_id: Optional[str] = None,
     optimizer_type: str = "adam",
     momentum: float = 0.0,
+    evaluate_test: bool = False,
 ) -> Dict[str, Any]:
     """Executes an in-process federated learning simulation using FedAvg.
 
@@ -727,269 +1635,31 @@ def run_federated_simulation(
         ``dp_summary``, ``privacy_ledger``, ``communication_cost``,
         ``communication_tracker``, and ``proxy_mapping``.
     """
-    if dp_config is not None and not isinstance(dp_config, DPConfig):
-        raise TypeError(f"dp_config must be a DPConfig or None, got {type(dp_config).__name__}.")
-    if isinstance(num_rounds, bool) or not isinstance(num_rounds, int) or num_rounds <= 0:
-        raise ValueError(f"num_rounds must be a positive integer, got {num_rounds!r}.")
-    if isinstance(local_epochs, bool) or not isinstance(local_epochs, int) or local_epochs <= 0:
-        raise ValueError(f"local_epochs must be a positive integer, got {local_epochs!r}.")
-    normalized_optimizer_type, validated_momentum = validate_optimizer_config(
+    _validate_num_clients(num_clients)
+    validated_batch_size = validate_batch_size(batch_size)
+    session = FederatedSession.from_simulation(
+        num_rounds=num_rounds,
+        num_clients=num_clients,
+        model_type=model_type,
+        seed=seed,
+        max_workers=max_workers,
+        local_epochs=local_epochs,
+        lr=lr,
+        batch_size=validated_batch_size,
+        n_stays=n_stays,
+        dp_config=dp_config,
+        weight_decay=weight_decay,
+        reset_optimizer_each_round=reset_optimizer_each_round,
+        epsilon_budget=epsilon_budget,
+        budget_check_mode=budget_check_mode,
+        planned_rounds=planned_rounds,
+        proxy_id_fn=proxy_id_fn,
+        round_metadata=round_metadata,
+        experiment_id=experiment_id,
         optimizer_type=optimizer_type,
         momentum=momentum,
+        timeout=None,
     )
-
-    effective_planned_rounds = num_rounds if planned_rounds is None else planned_rounds
-    if (
-        isinstance(effective_planned_rounds, bool)
-        or not isinstance(effective_planned_rounds, int)
-        or effective_planned_rounds <= 0
-    ):
-        raise ValueError(
-            f"planned_rounds must be a positive integer, got {planned_rounds!r}."
-        )
-
-    effective_dp_config = dp_config if dp_config is not None else DPConfig(dp_enabled=False)
-    effective_proxy_id_fn = (
-        proxy_id_fn if proxy_id_fn is not None else (lambda cid: f"careunit-proxy-{cid}")
-    )
-
-    logger.info(
-        "Initializing synthetic cohort and client partitions (seed=%s, dp_enabled=%s)...",
-        seed,
-        effective_dp_config.dp_enabled,
-    )
-
-    # 1. Build synthetic cohort and patient-level split (zero disk side-effects)
-    df = generate_mock_data(n_stays=n_stays, seed=seed)
-    train_df, val_df, test_df = patient_level_split(
-        df,
-        seed=seed,
-        frac=(0.7, 0.15, 0.15),
-        splits_dir="",
-    )
-
-    train_subjects = set(train_df["subject_id"])
-    val_subjects = set(val_df["subject_id"])
-    test_subjects = set(test_df["subject_id"])
-    if (
-        (train_subjects & val_subjects)
-        or (train_subjects & test_subjects)
-        or (val_subjects & test_subjects)
-    ):
-        raise RuntimeError(
-            "Patient-level split leakage detected across train_df, val_df, and test_df."
-        )
-
-    # 2. Fit shared preprocessor ONCE on the full global training split ONLY
-    #    (strictly zero leakage from val_df or test_df; outside DP-SGD guarantee)
-    shared_preprocessor = TabularPreprocessor()
-    shared_preprocessor.fit(train_df)
-
-    # 3. Partition both train and val into disjoint subsets matching careunits
-    train_partitions = partition_clients(
-        train_df,
-        num_clients=num_clients,
-        strategy="natural",
-        seed=seed,
-        output_dir="",
-        report_path="",
-    )
-    val_partitions = partition_clients(
-        val_df,
-        num_clients=num_clients,
-        strategy="natural",
-        seed=seed,
-        output_dir="",
-        report_path="",
-    )
-
-    # 4. Guard against empty partitions and verify cross-partition subject isolation
-    seen_train_subjects: set[Any] = set()
-    seen_val_subjects: set[Any] = set()
-    for cid in range(num_clients):
-        if cid not in train_partitions or len(train_partitions[cid]) == 0:
-            raise ValueError(f"Client {cid} training partition is empty. Cannot execute FedAvg.")
-        if cid not in val_partitions or len(val_partitions[cid]) == 0:
-            raise ValueError(f"Client {cid} validation partition is empty. Cannot execute FedAvg.")
-
-        c_train_subjects = set(train_partitions[cid]["subject_id"])
-        c_val_subjects = set(val_partitions[cid]["subject_id"])
-        if seen_train_subjects & c_train_subjects:
-            raise RuntimeError(f"Duplicate subject_id detected in train_partitions[{cid}].")
-        if seen_val_subjects & c_val_subjects:
-            raise RuntimeError(f"Duplicate subject_id detected in val_partitions[{cid}].")
-        seen_train_subjects.update(c_train_subjects)
-        seen_val_subjects.update(c_val_subjects)
-
-    if seen_train_subjects != train_subjects:
-        raise RuntimeError("train_partitions subject set does not match train_df.")
-    if seen_val_subjects != val_subjects:
-        raise RuntimeError("val_partitions subject set does not match val_df.")
-    if (seen_train_subjects & seen_val_subjects) or (seen_val_subjects & test_subjects):
-        raise RuntimeError("Subject-level isolation violated across partitioned splits.")
-
-    # 5. Instantiate 5 independent FLClient objects, explicit proxy mapping, and comm tracker
-    client_manager = SimpleClientManager()
-    registry = ClientProxyRegistry()
-    comm_tracker = CommunicationCostTracker(num_clients=num_clients)
-    clients: List[FLClient] = []
-
-    for cid in range(num_clients):
-        fl_client = FLClient(
-            client_id=cid,
-            train_df=train_partitions[cid],
-            val_df=val_partitions[cid],
-            model_type=model_type,
-            batch_size=batch_size,
-            base_seed=seed,
-            preprocessor=shared_preprocessor,
-            dp_config=effective_dp_config,
-            planned_rounds=effective_planned_rounds,
-            local_epochs=local_epochs,
-            lr=lr,
-            weight_decay=weight_decay,
-            reset_optimizer_each_round=reset_optimizer_each_round,
-            epsilon_budget=epsilon_budget,
-            budget_check_mode=budget_check_mode,
-            optimizer_type=normalized_optimizer_type,
-            momentum=validated_momentum,
-        )
-        clients.append(fl_client)
-        wrapped_client = fl_client.to_client()
-        proxy_cid = str(effective_proxy_id_fn(cid))
-        proxy = LocalClientProxy(
-            cid=proxy_cid,
-            client=wrapped_client,
-            hospital_client_id=cid,
-            comm_tracker=comm_tracker,
-        )
-        registry.register(proxy, fl_client)
-        client_manager.register(proxy)
-
-    if effective_dp_config.dp_enabled:
-        if epsilon_budget is not None:
-            ledger_budget: Optional[float] = float(epsilon_budget)
-        elif effective_dp_config.noise_multiplier is None:
-            ledger_budget = float(effective_dp_config.epsilon_target)
-        else:
-            ledger_budget = None
-    else:
-        ledger_budget = None
-
-    ledger = CumulativePrivacyLedger(
-        num_clients=num_clients,
-        dp_enabled=effective_dp_config.dp_enabled,
-        epsilon_budget=ledger_budget,
-        delta=effective_dp_config.delta if effective_dp_config.dp_enabled else None,
-        accountant=effective_dp_config.accountant if effective_dp_config.dp_enabled else None,
-        privacy_unit=effective_dp_config.privacy_unit,
-        adjacency=effective_dp_config.adjacency,
-        preprocessing_covered_by_dp=False,
-    )
-
-    # 6. Extract initial parameters from an independent reference model with fixed seed
-    torch.manual_seed(seed)
-    input_dim = shared_preprocessor.transform(train_df)[0].shape[1]
-    ref_model = _build_baseline_model(model_type=model_type, input_dim=input_dim)
-
-    initial_parameters_list = ref_model.get_parameters()
-    initial_parameters = ndarrays_to_parameters(initial_parameters_list)
-
-    # 7. Fit configuration hook aligned with client calibration schedule
-    def fit_config_fn(server_round: int) -> Dict[str, Scalar]:
-        return {
-            "local_epochs": local_epochs,
-            "lr": lr,
-            "weight_decay": weight_decay,
-            "server_round": server_round,
-        }
-
-    # 8. Configure PrivacyAwareFedAvg strategy and Server instance
-    strategy = get_fedavg_strategy(
-        initial_parameters=initial_parameters,
-        min_clients=num_clients,
-        on_fit_config_fn=fit_config_fn,
-        registry=registry,
-        ledger=ledger,
-        dp_config=effective_dp_config,
-        comm_tracker=comm_tracker,
-        round_metadata=round_metadata,
-    )
-
-    server = Server(client_manager=client_manager, strategy=strategy)
-    if max_workers is not None:
-        server.max_workers = max_workers
-
-    # 9. Run simulation (seed global torch RNG for sequential MLP Dropout determinism)
-    torch.manual_seed(seed)
-    history, elapsed = server.fit(num_rounds=num_rounds, timeout=None)
-
-    # 10. Collect verified federation-level DP privacy summary (max across disjoint clients)
-    dp_summary = collect_federation_privacy_summary(
-        clients=clients,
-        dp_config=effective_dp_config,
-        expected_rounds=num_rounds,
-        expected_num_clients=num_clients,
-        ledger=ledger,
-        registry=registry,
-    )
-
-    # 11. Retrieve and verify final aggregated global parameters
-    if server.parameters is None:
-        raise RuntimeError("Federated simulation ended without producing global server parameters.")
-
-    final_ndarrays = parameters_to_ndarrays(server.parameters)
-
-    # 12. Load final weights into clean global model
-    global_model = _build_baseline_model(model_type=model_type, input_dim=input_dim)
-    global_model.set_parameters(final_ndarrays)
-
-    # 13. Checkpoint persistence and verification
-    if checkpoint_path:
-        os.makedirs(os.path.dirname(checkpoint_path) or ".", exist_ok=True)
-        if global_model.net is None:
-            raise RuntimeError("Global model network is None; cannot save checkpoint.")
-
-        torch.save(global_model.net.state_dict(), checkpoint_path)
-
-        # Verification: reload into fresh model instance
-        verify_model = _build_baseline_model(model_type=model_type, input_dim=input_dim)
-
-        if verify_model.net is None:
-            raise RuntimeError("Verification model network is None.")
-
-        verify_model.net.load_state_dict(torch.load(checkpoint_path, weights_only=True))
-        reloaded_ndarrays = verify_model.get_parameters()
-
-        for p_exp, p_act in zip(final_ndarrays, reloaded_ndarrays):
-            np.testing.assert_allclose(
-                p_act,
-                p_exp,
-                rtol=1e-5,
-                atol=1e-5,
-                err_msg="Reloaded checkpoint does not match final server parameters.",
-            )
-
-    return {
-        "history": history,
-        "elapsed": elapsed,
-        "final_parameters": final_ndarrays,
-        "initial_parameters": initial_parameters_list,
-        "global_model": global_model,
-        "clients": clients,
-        "preprocessor": shared_preprocessor,
-        "val_df": val_df.copy(),
-        "val_partitions": {cid: part_df.copy() for cid, part_df in val_partitions.items()},
-        "test_df": test_df,
-        "dp_summary": dp_summary,
-        "privacy_ledger": ledger,
-        "communication_cost": comm_tracker.to_registry_dict(
-            experiment_id=experiment_id,
-            seed=seed,
-        ),
-        "communication_tracker": comm_tracker,
-        "proxy_mapping": {
-            "proxy_to_client_id": dict(registry.proxy_to_client_id),
-            "client_id_to_proxy_id": dict(registry.client_id_to_proxy_id),
-        },
-    }
+    session.initialize()
+    session.run_rounds(num_rounds=num_rounds)
+    return session.finalize(checkpoint_path=checkpoint_path, evaluate_test=evaluate_test)

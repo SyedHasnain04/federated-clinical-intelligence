@@ -17,6 +17,8 @@ from opacus import PrivacyEngine
 from opacus.accountants import create_accountant
 from opacus.accountants.accountant import IAccountant
 
+from privacy.dp_wrapper import validate_accountant_sample_rate
+
 PARALLEL_COMPOSITION_RULE = "parallel_composition_disjoint_partitions_max"
 
 VALID_ENTRY_STATUSES = frozenset({"completed", "blocked", "non_private"})
@@ -149,8 +151,7 @@ def compute_prospective_epsilon(
     mechanism = live_accountant.mechanism()
     sigma = float(noise_multiplier)
     q = float(sample_rate)
-    if mechanism == "prv" and q == 1.0:
-        raise ValueError("Opacus PRVAccountant cannot compute prospective epsilon at sample_rate=1.0.")
+    validate_accountant_sample_rate(mechanism, q)
 
     probe = create_accountant(mechanism=mechanism)
     probe.load_state_dict(live_accountant.state_dict())
@@ -610,8 +611,7 @@ def track_privacy_expenditure(
         raise ValueError(
             f"cumulative_ledger_rounds must be a non-negative integer, got {cumulative_ledger_rounds!r}."
         )
-    if acct == "prv" and float(sample_rate) == 1.0:
-        raise ValueError("accountant='prv' cannot evaluate privacy expenditure at sample_rate=1.0.")
+    validate_accountant_sample_rate(acct, float(sample_rate))
 
     if steps == 0:
         eps_realized = 0.0

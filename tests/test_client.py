@@ -6,11 +6,24 @@ import pandas as pd
 import torch
 from opacus.data_loader import DPDataLoader
 
-from client.client_app import FLClient
+from client.client_app import (
+    FLClient,
+    validate_accountant_sample_rate,
+    validate_client_preprocessor,
+    validate_learning_rate,
+    validate_local_epochs,
+    validate_weight_decay,
+)
 from data.mock_schema import generate_mock_data
 from data.partition import partition_clients
 from data.split import patient_level_split
-from models.baseline import TabularPreprocessor
+from models.baseline import (
+    CANONICAL_FEATURES,
+    CANONICAL_FEATURE_DIM,
+    TabularPreprocessor,
+    validate_batch_size,
+    validate_binary_labels,
+)
 from privacy import DPConfig
 
 
@@ -902,3 +915,1210 @@ def test_client_invalid_optimizer_and_momentum_rejected(partitioned_data, opt_ty
             optimizer_type=opt_type,
             momentum=mom,
         )
+
+
+def test_client_non_private_adam_optimizer_reset_vs_persistent_between_rounds(partitioned_data):
+    """Verifies non-private Adam optimizer state clears when reset=True and persists when reset=False."""
+    train_partitions, val_partitions, shared_prep, _, _, _ = partitioned_data
+
+    # 1. reset_optimizer_each_round=True clears state between fit() calls
+    client_reset = FLClient(
+        client_id=0,
+        train_df=train_partitions[0],
+        val_df=val_partitions[0],
+        model_type="logistic_regression",
+        batch_size=32,
+        base_seed=42,
+        preprocessor=shared_prep,
+        dp_config=None,
+        local_epochs=1,
+        reset_optimizer_each_round=True,
+        optimizer_type="adam",
+    )
+    assert client_reset.optimizer is not None
+    assert client_reset.dp_optimizer is None
+    opt_reset_id = id(client_reset.optimizer)
+    batches_per_round = len(client_reset.train_loader)
+
+    init_params = [p.copy() for p in client_reset.get_parameters(config={})]
+
+    # Round 1
+    params_r1, n1, m1 = client_reset.fit(init_params, config={})
+    p_r1_snapshot = [arr.copy() for arr in params_r1]
+    assert id(client_reset.optimizer) == opt_reset_id
+    step_count_r1 = next(iter(client_reset.optimizer.state.values()))["step"]
+    step_count_r1_int = int(step_count_r1.item() if isinstance(step_count_r1, torch.Tensor) else step_count_r1)
+    assert step_count_r1_int == batches_per_round
+    assert all(p is b for p, b in zip(client_reset.optimizer.param_groups[0]["params"], client_reset.model.net.parameters()))
+
+    # Round 2: optimizer state must reset before fit and finish with batches_per_round (not 2 * batches_per_round)
+    params_r2, n2, m2 = client_reset.fit(p_r1_snapshot, config={})
+    assert id(client_reset.optimizer) == opt_reset_id
+    step_count_r2 = next(iter(client_reset.optimizer.state.values()))["step"]
+    step_count_r2_int = int(step_count_r2.item() if isinstance(step_count_r2, torch.Tensor) else step_count_r2)
+    assert step_count_r2_int == batches_per_round
+    assert all(p is b for p, b in zip(client_reset.optimizer.param_groups[0]["params"], client_reset.model.net.parameters()))
+
+    # 2. reset_optimizer_each_round=False preserves cumulative Adam step state across rounds
+    client_persist = FLClient(
+        client_id=0,
+        train_df=train_partitions[0],
+        val_df=val_partitions[0],
+        model_type="logistic_regression",
+        batch_size=32,
+        base_seed=42,
+        preprocessor=shared_prep,
+        dp_config=None,
+        local_epochs=1,
+        reset_optimizer_each_round=False,
+        optimizer_type="adam",
+    )
+    assert client_persist.optimizer is not None
+    assert client_persist.dp_optimizer is None
+    opt_persist_id = id(client_persist.optimizer)
+
+    p = [arr.copy() for arr in client_persist.get_parameters(config={})]
+    p, _, _ = client_persist.fit(p, config={})
+    assert id(client_persist.optimizer) == opt_persist_id
+    persist_step_r1 = next(iter(client_persist.optimizer.state.values()))["step"]
+    persist_step_r1_int = int(persist_step_r1.item() if isinstance(persist_step_r1, torch.Tensor) else persist_step_r1)
+    assert persist_step_r1_int == batches_per_round
+
+    p, _, _ = client_persist.fit(p, config={})
+    assert id(client_persist.optimizer) == opt_persist_id
+    persist_step_r2 = next(iter(client_persist.optimizer.state.values()))["step"]
+    persist_step_r2_int = int(persist_step_r2.item() if isinstance(persist_step_r2, torch.Tensor) else persist_step_r2)
+    assert persist_step_r2_int == 2 * batches_per_round
+    assert all(p is b for p, b in zip(client_persist.optimizer.param_groups[0]["params"], client_persist.model.net.parameters()))
+
+
+def test_client_non_private_sgd_momentum_reset_vs_persistent_between_rounds(partitioned_data):
+    """Verifies non-private SGD momentum_buffer resets when reset=True and persists across rounds when reset=False."""
+    train_partitions, val_partitions, shared_prep, _, _, _ = partitioned_data
+
+    def _make_client(reset_opt: bool) -> FLClient:
+        return FLClient(
+            client_id=1,
+            train_df=train_partitions[1],
+            val_df=val_partitions[1],
+            model_type="mlp",
+            batch_size=32,
+            base_seed=42,
+            preprocessor=shared_prep,
+            dp_config=None,
+            local_epochs=1,
+            lr=0.05,
+            weight_decay=1e-4,
+            reset_optimizer_each_round=reset_opt,
+            optimizer_type="sgd",
+            momentum=0.9,
+        )
+
+    client_reset = _make_client(reset_opt=True)
+    client_persist = _make_client(reset_opt=False)
+    client_fresh_r2 = _make_client(reset_opt=True)
+
+    assert client_reset.optimizer is not None
+    assert client_persist.optimizer is not None
+    opt_reset_id = id(client_reset.optimizer)
+    opt_persist_id = id(client_persist.optimizer)
+
+    init_params = [p.copy() for p in client_reset.get_parameters(config={})]
+
+    # Round 1
+    torch.manual_seed(123)
+    p_r1_reset, _, m1_reset = client_reset.fit(init_params, config={})
+    p_r1_reset_snapshot = [arr.copy() for arr in p_r1_reset]
+
+    torch.manual_seed(123)
+    p_r1_persist, _, m1_persist = client_persist.fit(init_params, config={})
+    p_r1_persist_snapshot = [arr.copy() for arr in p_r1_persist]
+
+    # After R1, both should match identically
+    for a, b in zip(p_r1_reset_snapshot, p_r1_persist_snapshot):
+        np.testing.assert_allclose(a, b, atol=0.0, rtol=0.0)
+
+    # Verify momentum buffer exists in both optimizers
+    assert len(client_reset.optimizer.state) > 0
+    assert all("momentum_buffer" in st for st in client_reset.optimizer.state.values())
+    assert len(client_persist.optimizer.state) > 0
+    assert all("momentum_buffer" in st for st in client_persist.optimizer.state.values())
+
+    # Sync client_fresh_r2 torch_generator to client_reset's state post-R1
+    assert len(client_fresh_r2.optimizer.state) == 0
+    client_fresh_r2.torch_generator.set_state(client_reset.torch_generator.get_state().clone())
+
+    # Round 2
+    torch.manual_seed(456)
+    p_r2_reset, _, m2_reset = client_reset.fit(p_r1_reset_snapshot, config={})
+    p_r2_reset_snapshot = [arr.copy() for arr in p_r2_reset]
+
+    torch.manual_seed(456)
+    p_r2_fresh, _, _ = client_fresh_r2.fit(p_r1_reset_snapshot, config={})
+    p_r2_fresh_snapshot = [arr.copy() for arr in p_r2_fresh]
+
+    torch.manual_seed(456)
+    p_r2_persist, _, m2_persist = client_persist.fit(p_r1_persist_snapshot, config={})
+    p_r2_persist_snapshot = [arr.copy() for arr in p_r2_persist]
+
+    # Optimizer instances must persist
+    assert id(client_reset.optimizer) == opt_reset_id
+    assert id(client_persist.optimizer) == opt_persist_id
+
+    # If reset cleared momentum_buffer, client_reset matches client_fresh_r2 exactly
+    for a, b in zip(p_r2_reset_snapshot, p_r2_fresh_snapshot):
+        np.testing.assert_allclose(a, b, atol=0.0, rtol=0.0)
+
+    # Persistent momentum diverged from reset on Round 2 because momentum buffer carried over
+    assert any(not np.allclose(a, b) for a, b in zip(p_r2_reset_snapshot, p_r2_persist_snapshot))
+
+    # Parameters remain bound to optimizer
+    assert all(p is b for p, b in zip(client_reset.optimizer.param_groups[0]["params"], client_reset.model.net.parameters()))
+    assert all(p is b for p, b in zip(client_persist.optimizer.param_groups[0]["params"], client_persist.model.net.parameters()))
+
+
+def test_client_non_private_optimizer_hyperparameter_updates_preserve_instance_and_state(partitioned_data):
+    """Verifies lr and weight_decay config overrides update in-place without recreating optimizer or resetting state."""
+    train_partitions, val_partitions, shared_prep, _, _, _ = partitioned_data
+    client = FLClient(
+        client_id=2,
+        train_df=train_partitions[2],
+        val_df=val_partitions[2],
+        model_type="logistic_regression",
+        batch_size=32,
+        base_seed=42,
+        preprocessor=shared_prep,
+        dp_config=None,
+        local_epochs=1,
+        lr=0.01,
+        weight_decay=1e-4,
+        reset_optimizer_each_round=False,
+        optimizer_type="adam",
+    )
+
+    assert client.optimizer is not None
+    opt_id = id(client.optimizer)
+    assert client.optimizer.param_groups[0]["lr"] == pytest.approx(0.01)
+    assert client.optimizer.param_groups[0]["weight_decay"] == pytest.approx(1e-4)
+
+    init_params = [p.copy() for p in client.get_parameters(config={})]
+    batches_per_round = len(client.train_loader)
+
+    # Round 1 with override lr=0.005, weight_decay=2e-4
+    params_r1, _, _ = client.fit(init_params, config={"lr": 0.005, "weight_decay": 2e-4})
+    params_r1_snapshot = [arr.copy() for arr in params_r1]
+    assert id(client.optimizer) == opt_id
+    assert client.optimizer.param_groups[0]["lr"] == pytest.approx(0.005)
+    assert client.optimizer.param_groups[0]["weight_decay"] == pytest.approx(2e-4)
+
+    step_r1 = next(iter(client.optimizer.state.values()))["step"]
+    step_r1_int = int(step_r1.item() if isinstance(step_r1, torch.Tensor) else step_r1)
+    assert step_r1_int == batches_per_round
+
+    # Round 2 with another override lr=0.002, weight_decay=5e-4
+    params_r2, _, _ = client.fit(params_r1_snapshot, config={"lr": 0.002, "weight_decay": 5e-4})
+    assert id(client.optimizer) == opt_id
+    assert client.optimizer.param_groups[0]["lr"] == pytest.approx(0.002)
+    assert client.optimizer.param_groups[0]["weight_decay"] == pytest.approx(5e-4)
+
+    step_r2 = next(iter(client.optimizer.state.values()))["step"]
+    step_r2_int = int(step_r2.item() if isinstance(step_r2, torch.Tensor) else step_r2)
+    assert step_r2_int == 2 * batches_per_round
+
+    # Verify model parameters updated and are finite
+    for arr in params_r2:
+        assert np.isfinite(arr).all()
+    assert any(not np.allclose(a, b) for a, b in zip(params_r1_snapshot, params_r2))
+
+
+@pytest.mark.parametrize(
+    "valid_val",
+    [1, 2, 3, 10, 100],
+)
+def test_validate_local_epochs_accepts_positive_integers(valid_val):
+    """Verifies validate_local_epochs returns genuine positive integers unchanged."""
+    res = validate_local_epochs(valid_val)
+    assert res == valid_val
+    assert isinstance(res, int)
+    assert not isinstance(res, bool)
+
+
+@pytest.mark.parametrize(
+    ("invalid_val", "expected_exc", "match_str"),
+    [
+        (0, ValueError, "positive integer"),
+        (-1, ValueError, "positive integer"),
+        (-10, ValueError, "positive integer"),
+        (True, TypeError, "must be an int"),
+        (False, TypeError, "must be an int"),
+        (0.0, TypeError, "must be an int"),
+        (1.0, TypeError, "must be an int"),
+        (2.5, TypeError, "must be an int"),
+        (-1.5, TypeError, "must be an int"),
+        ("1", TypeError, "must be an int"),
+        ("0", TypeError, "must be an int"),
+        ("abc", TypeError, "must be an int"),
+        ("", TypeError, "must be an int"),
+        (None, TypeError, "must be an int"),
+        ([1], TypeError, "must be an int"),
+        ({"local_epochs": 1}, TypeError, "must be an int"),
+    ],
+)
+def test_validate_local_epochs_rejects_invalid_types_and_values(invalid_val, expected_exc, match_str):
+    """Verifies validate_local_epochs rejects non-ints with TypeError and non-positives with ValueError."""
+    with pytest.raises(expected_exc, match=match_str):
+        validate_local_epochs(invalid_val)
+
+
+@pytest.mark.parametrize(
+    ("invalid_val", "expected_exc"),
+    [
+        (0, ValueError),
+        (-1, ValueError),
+        (True, TypeError),
+        (False, TypeError),
+        (2.5, TypeError),
+        (0.0, TypeError),
+        ("3", TypeError),
+        ("abc", TypeError),
+        (None, TypeError),
+    ],
+)
+def test_client_init_rejects_invalid_local_epochs(partitioned_data, invalid_val, expected_exc):
+    """Verifies FLClient constructor rejects invalid local_epochs without silent coercion."""
+    train_partitions, val_partitions, shared_prep, _, _, _ = partitioned_data
+    with pytest.raises(expected_exc):
+        FLClient(
+            client_id=0,
+            train_df=train_partitions[0],
+            val_df=val_partitions[0],
+            preprocessor=shared_prep,
+            local_epochs=invalid_val,
+        )
+
+
+def test_client_init_accepts_valid_local_epochs(partitioned_data):
+    """Verifies FLClient constructor sets planned_local_epochs for valid integer."""
+    train_partitions, val_partitions, shared_prep, _, _, _ = partitioned_data
+    client = FLClient(
+        client_id=0,
+        train_df=train_partitions[0],
+        val_df=val_partitions[0],
+        preprocessor=shared_prep,
+        local_epochs=4,
+    )
+    assert client.planned_local_epochs == 4
+
+
+@pytest.mark.parametrize("is_dp", [False, True])
+@pytest.mark.parametrize(
+    ("invalid_val", "expected_exc"),
+    [
+        (0, ValueError),
+        (-1, ValueError),
+        (True, TypeError),
+        (False, TypeError),
+        (2.5, TypeError),
+        (0.0, TypeError),
+        ("3", TypeError),
+        ("abc", TypeError),
+        (None, TypeError),
+    ],
+)
+def test_client_fit_rejects_invalid_local_epochs_before_state_mutation(
+    partitioned_data, is_dp, invalid_val, expected_exc
+):
+    """Verifies fit() rejects invalid local_epochs before changing model weights or incrementing counters."""
+    train_partitions, val_partitions, shared_prep, _, _, _ = partitioned_data
+    dp_cfg = DPConfig(dp_enabled=True, epsilon_target=3.0, accountant="rdp") if is_dp else None
+
+    client = FLClient(
+        client_id=0,
+        train_df=train_partitions[0],
+        val_df=val_partitions[0],
+        preprocessor=shared_prep,
+        dp_config=dp_cfg,
+        planned_rounds=2,
+        local_epochs=2,
+    )
+
+    init_params = [p.copy() for p in client.get_parameters(config={})]
+    candidate_params = [p + 5.0 for p in init_params]
+
+    rounds_before = client.rounds_executed
+    attempts_before = client._fit_attempt_counter
+
+    with pytest.raises(expected_exc):
+        client.fit(candidate_params, config={"local_epochs": invalid_val})
+
+    # Model parameters must remain completely unchanged (candidate weights not loaded)
+    current_params = client.get_parameters(config={})
+    for p_init, p_cur in zip(init_params, current_params):
+        np.testing.assert_allclose(p_cur, p_init, atol=0.0, rtol=0.0)
+
+    # Counters must not increment
+    assert client.rounds_executed == rounds_before
+    assert client._fit_attempt_counter == attempts_before
+
+
+@pytest.mark.parametrize("is_dp", [False, True])
+def test_client_fit_accepts_valid_local_epochs_and_omitted_default(partitioned_data, is_dp):
+    """Verifies fit() accepts omitted local_epochs (falling back to planned) and valid positive overrides."""
+    train_partitions, val_partitions, shared_prep, _, _, _ = partitioned_data
+    dp_cfg = DPConfig(dp_enabled=True, epsilon_target=3.0, accountant="rdp") if is_dp else None
+
+    client = FLClient(
+        client_id=0,
+        train_df=train_partitions[0],
+        val_df=val_partitions[0],
+        preprocessor=shared_prep,
+        dp_config=dp_cfg,
+        planned_rounds=3,
+        local_epochs=2,
+    )
+
+    init_params = [p.copy() for p in client.get_parameters(config={})]
+
+    # 1. Omitted local_epochs falls back to planned_local_epochs (2)
+    p1, n1, m1 = client.fit(init_params, config={})
+    assert n1 == len(train_partitions[0])
+    assert client.rounds_executed == 1
+    assert any(not np.allclose(a, b) for a, b in zip(init_params, p1))
+    p1_snapshot = [p.copy() for p in p1]
+
+    # 2. Valid override local_epochs=1 executes successfully
+    p2, n2, m2 = client.fit(p1_snapshot, config={"local_epochs": 1})
+    assert n2 == len(train_partitions[0])
+    assert client.rounds_executed == 2
+    assert any(not np.allclose(a, b) for a, b in zip(p1_snapshot, p2))
+
+
+def test_validate_accountant_sample_rate_helper():
+    """Verifies centralized validate_accountant_sample_rate accepts RDP and q<1 PRV, rejects q>=1 PRV."""
+    # RDP accepts any valid sample rate including 1.0
+    validate_accountant_sample_rate("rdp", 1.0)
+    validate_accountant_sample_rate("rdp", 0.05)
+    validate_accountant_sample_rate("RDP", 1.0)
+
+    # PRV accepts q < 1.0
+    validate_accountant_sample_rate("prv", 0.05)
+    validate_accountant_sample_rate("PRV", 0.5)
+
+    # PRV rejects q = 1.0 and numerical proximity to 1.0
+    with pytest.raises(ValueError, match="accountant='prv' cannot be used with sample_rate=1.0"):
+        validate_accountant_sample_rate("prv", 1.0)
+
+    with pytest.raises(ValueError, match="accountant='prv' cannot be used with sample_rate="):
+        validate_accountant_sample_rate("prv", 1.0 - 1e-10)
+
+    # Verify message contents
+    with pytest.raises(ValueError) as exc_info:
+        validate_accountant_sample_rate("prv", 1.0)
+    msg = str(exc_info.value)
+    assert "accountant='prv'" in msg
+    assert "sample_rate=1.0" in msg
+    assert "divide-by-zero" in msg
+    assert "accountant='rdp'" in msg
+
+
+def test_client_prv_sample_rate_1_fails_closed_across_all_entry_points(partitioned_data):
+    """Verifies PRV at q=1.0 fails closed with clear error across constructor, prospective, and fit paths."""
+    train_partitions, val_partitions, shared_prep, _, _, _ = partitioned_data
+    small_train = train_partitions[4].iloc[:16].copy()
+
+    # 1. Constructor rejects unsupported configuration on small partition (len(train_loader) == 1 => q = 1.0)
+    with pytest.raises(ValueError, match="accountant='prv' cannot be used with sample_rate=1.0"):
+        FLClient(
+            client_id=4,
+            train_df=small_train,
+            val_df=val_partitions[4],
+            batch_size=32,
+            preprocessor=shared_prep,
+            dp_config=DPConfig(dp_enabled=True, epsilon_target=3.0, accountant="prv"),
+            planned_rounds=1,
+            local_epochs=1,
+        )
+
+    # 2. For an existing PRV client, if sample_rate is 1.0, prospective methods fail closed rather than returning None
+    client = FLClient(
+        client_id=0,
+        train_df=train_partitions[0],
+        val_df=val_partitions[0],
+        batch_size=32,
+        preprocessor=shared_prep,
+        dp_config=DPConfig(dp_enabled=True, epsilon_target=3.0, accountant="prv"),
+        planned_rounds=2,
+        local_epochs=1,
+    )
+    assert client.dp_attachment.sample_rate < 1.0
+
+    # Simulate q=1.0 on the attachment
+    client.dp_attachment.sample_rate = 1.0
+
+    # A. _compute_prospective_steps_epsilon fails clearly
+    with pytest.raises(ValueError, match="accountant='prv' cannot be used with sample_rate=1.0"):
+        client._compute_prospective_steps_epsilon(1)
+
+    # B. _get_prospective_next_step_epsilon fails closed (never returns None)
+    with pytest.raises(ValueError, match="accountant='prv' cannot be used with sample_rate=1.0"):
+        client._get_prospective_next_step_epsilon()
+
+    # C. get_privacy_report fails closed and never produces a misleading within_budget status
+    with pytest.raises(ValueError, match="accountant='prv' cannot be used with sample_rate=1.0"):
+        client.get_privacy_report()
+
+    # D. _validate_dp_schedule fails clearly
+    with pytest.raises(ValueError, match="accountant='prv' cannot be used with sample_rate=1.0"):
+        client._validate_dp_schedule(local_epochs=1)
+
+    # E. fit() fails before changing model weights, incrementing counters, or advancing accountant
+    init_params = [p.copy() for p in client.get_parameters(config={})]
+    candidate_params = [p + 2.0 for p in init_params]
+    with pytest.raises(ValueError, match="accountant='prv' cannot be used with sample_rate=1.0"):
+        client.fit(candidate_params, config={})
+
+    current_params = client.get_parameters(config={})
+    for p_init, p_cur in zip(init_params, current_params):
+        np.testing.assert_allclose(p_cur, p_init, atol=0.0, rtol=0.0)
+    assert client.rounds_executed == 0
+    assert client._fit_attempt_counter == 0
+    assert len(client.privacy_engine.accountant.history) == 0
+
+
+def test_client_rdp_sample_rate_1_full_lifecycle_and_budget_enforcement(partitioned_data):
+    """Verifies RDP at q=1.0 supports prospective calculation, DP training, budget checks, and ledger reporting."""
+    train_partitions, val_partitions, shared_prep, _, _, _ = partitioned_data
+    small_train = train_partitions[4].iloc[:16].copy()
+
+    # 1. Constructor succeeds at q=1.0 with RDP
+    client = FLClient(
+        client_id=4,
+        train_df=small_train,
+        val_df=val_partitions[4],
+        batch_size=32,
+        preprocessor=shared_prep,
+        dp_config=DPConfig(dp_enabled=True, epsilon_target=3.0, accountant="rdp"),
+        planned_rounds=2,
+        local_epochs=1,
+    )
+    assert client.dp_attachment.sample_rate == 1.0
+
+    # 2. Prospective next-step epsilon computes cleanly and returns a positive float
+    prosp_next = client._get_prospective_next_step_epsilon()
+    assert prosp_next is not None
+    assert isinstance(prosp_next, float)
+    assert prosp_next > 0.0
+
+    # 3. Privacy report correctly reflects q=1.0 and prospective value
+    report = client.get_privacy_report()
+    assert report["sample_rate"] == 1.0
+    assert report["prospective_next_step_epsilon"] == pytest.approx(prosp_next)
+    assert report["accountant"] == "rdp"
+
+    # 4. Training executes successfully
+    init_params = [p.copy() for p in client.get_parameters(config={})]
+    p1, n1, m1 = client.fit(init_params, config={})
+    assert n1 == len(small_train)
+    assert client.rounds_executed == 1
+    assert m1["dp_sample_rate"] == 1.0
+    assert m1["epsilon_realized"] > 0.0
+    assert any(not np.allclose(a, b) for a, b in zip(init_params, p1))
+
+    # 5. Budget enforcement remains active and catches budget exhaustion
+    client_budget = FLClient(
+        client_id=4,
+        train_df=small_train,
+        val_df=val_partitions[4],
+        batch_size=32,
+        preprocessor=shared_prep,
+        dp_config=DPConfig(dp_enabled=True, noise_multiplier=1.0, accountant="rdp"),
+        epsilon_budget=0.01,  # Unattainably small budget
+        planned_rounds=1,
+        local_epochs=1,
+    )
+    assert client_budget.dp_attachment.sample_rate == 1.0
+    from eval.privacy_ledger import PrivacyBudgetExhaustedError
+    with pytest.raises(PrivacyBudgetExhaustedError, match="DP budget exhausted before round"):
+        client_budget.fit(init_params, config={})
+
+
+def test_client_non_dp_preserves_legitimate_none_prospective_epsilon(partitioned_data):
+    """Verifies non-DP client legitimately returns None for prospective calculations without error."""
+    train_partitions, val_partitions, shared_prep, _, _, _ = partitioned_data
+    client = FLClient(
+        client_id=1,
+        train_df=train_partitions[1],
+        val_df=val_partitions[1],
+        preprocessor=shared_prep,
+        dp_config=None,
+    )
+    assert client._get_prospective_next_step_epsilon() is None
+    report = client.get_privacy_report()
+    assert report["dp_enabled"] is False
+    assert report["prospective_next_step_epsilon"] is None
+    assert report["budget_status"] == "not_applicable"
+
+
+# ============================================================================
+# Task 2 Fix 1: Learning-Rate and Weight-Decay Strict Validation Tests
+# ============================================================================
+
+
+def test_validate_learning_rate_valid_types_and_values():
+    """Verifies validate_learning_rate accepts positive finite floats, ints, and numpy numbers."""
+    assert validate_learning_rate(1e-4) == 0.0001
+    assert validate_learning_rate(0.001) == 0.001
+    assert validate_learning_rate(0.05) == 0.05
+    assert validate_learning_rate(1.0) == 1.0
+    assert validate_learning_rate(1) == 1.0
+    assert validate_learning_rate(2) == 2.0
+    assert isinstance(validate_learning_rate(1), float)
+    assert validate_learning_rate(np.float32(0.01)) == pytest.approx(0.01)
+    assert validate_learning_rate(np.float64(0.005)) == pytest.approx(0.005)
+    assert validate_learning_rate(np.int32(1)) == 1.0
+
+
+def test_validate_learning_rate_invalid_types_raise_typeerror():
+    """Verifies validate_learning_rate rejects booleans and non-numeric types with TypeError."""
+    invalid_types = [
+        True,
+        False,
+        np.bool_(True),
+        np.bool_(False),
+        "0.01",
+        "1e-3",
+        None,
+        [0.01],
+        (0.01,),
+        {"lr": 0.01},
+        object(),
+    ]
+    for bad_lr in invalid_types:
+        with pytest.raises(TypeError, match="lr must be a float or int"):
+            validate_learning_rate(bad_lr)
+
+
+def test_validate_learning_rate_invalid_values_raise_valueerror():
+    """Verifies validate_learning_rate rejects non-positive and non-finite values with ValueError."""
+    invalid_values = [
+        0,
+        0.0,
+        -0.0,
+        -1e-4,
+        -0.01,
+        -1,
+        -1.0,
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        np.nan,
+        np.inf,
+        -np.inf,
+    ]
+    for bad_lr in invalid_values:
+        with pytest.raises(ValueError, match="lr must be strictly positive and finite"):
+            validate_learning_rate(bad_lr)
+
+
+def test_validate_weight_decay_valid_types_and_values():
+    """Verifies validate_weight_decay accepts non-negative finite floats, ints, and numpy numbers."""
+    assert validate_weight_decay(0.0) == 0.0
+    assert validate_weight_decay(0) == 0.0
+    assert isinstance(validate_weight_decay(0), float)
+    assert validate_weight_decay(1e-5) == 0.00001
+    assert validate_weight_decay(1e-4) == 0.0001
+    assert validate_weight_decay(0.01) == 0.01
+    assert validate_weight_decay(1) == 1.0
+    assert validate_weight_decay(np.float32(0.0)) == 0.0
+    assert validate_weight_decay(np.float64(1e-4)) == pytest.approx(1e-4)
+    assert validate_weight_decay(np.int32(0)) == 0.0
+
+
+def test_validate_weight_decay_invalid_types_raise_typeerror():
+    """Verifies validate_weight_decay rejects booleans and non-numeric types with TypeError."""
+    invalid_types = [
+        True,
+        False,
+        np.bool_(True),
+        np.bool_(False),
+        "1e-4",
+        "0.0",
+        None,
+        [1e-4],
+        (0.0,),
+        {"weight_decay": 0.0},
+        object(),
+    ]
+    for bad_wd in invalid_types:
+        with pytest.raises(TypeError, match="weight_decay must be a float or int"):
+            validate_weight_decay(bad_wd)
+
+
+def test_validate_weight_decay_invalid_values_raise_valueerror():
+    """Verifies validate_weight_decay rejects strictly negative and non-finite values with ValueError."""
+    invalid_values = [
+        -1e-5,
+        -0.01,
+        -1,
+        -1.0,
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        np.nan,
+        np.inf,
+        -np.inf,
+    ]
+    for bad_wd in invalid_values:
+        with pytest.raises(ValueError, match="weight_decay must be non-negative and finite"):
+            validate_weight_decay(bad_wd)
+
+
+def test_flclient_constructor_lr_and_weight_decay_validation(partitioned_data):
+    """Verifies FLClient constructor validates default lr and weight_decay fail-closed."""
+    train_partitions, val_partitions, shared_prep, _, _, _ = partitioned_data
+
+    # Valid non-DP initialization (including weight_decay=0.0)
+    client_valid = FLClient(
+        client_id=0,
+        train_df=train_partitions[0],
+        val_df=val_partitions[0],
+        preprocessor=shared_prep,
+        lr=0.01,
+        weight_decay=0.0,
+    )
+    assert client_valid.default_lr == 0.01
+    assert client_valid.default_weight_decay == 0.0
+    assert client_valid.optimizer.param_groups[0]["lr"] == pytest.approx(0.01)
+    assert client_valid.optimizer.param_groups[0]["weight_decay"] == pytest.approx(0.0)
+
+    # Invalid constructor lr types and values
+    for bad_lr, exc, match_str in [
+        (True, TypeError, "lr must be a float or int"),
+        ("0.01", TypeError, "lr must be a float or int"),
+        (0.0, ValueError, "lr must be strictly positive and finite"),
+        (-0.01, ValueError, "lr must be strictly positive and finite"),
+        (float("nan"), ValueError, "lr must be strictly positive and finite"),
+        (float("inf"), ValueError, "lr must be strictly positive and finite"),
+    ]:
+        with pytest.raises(exc, match=match_str):
+            FLClient(
+                client_id=0,
+                train_df=train_partitions[0],
+                val_df=val_partitions[0],
+                preprocessor=shared_prep,
+                lr=bad_lr,
+            )
+
+    # Invalid constructor weight_decay types and values
+    for bad_wd, exc, match_str in [
+        (False, TypeError, "weight_decay must be a float or int"),
+        ("1e-4", TypeError, "weight_decay must be a float or int"),
+        (-1e-4, ValueError, "weight_decay must be non-negative and finite"),
+        (float("nan"), ValueError, "weight_decay must be non-negative and finite"),
+        (float("inf"), ValueError, "weight_decay must be non-negative and finite"),
+    ]:
+        with pytest.raises(exc, match=match_str):
+            FLClient(
+                client_id=0,
+                train_df=train_partitions[0],
+                val_df=val_partitions[0],
+                preprocessor=shared_prep,
+                weight_decay=bad_wd,
+            )
+
+    # Valid DP initialization with weight_decay=0.0
+    client_dp_valid = FLClient(
+        client_id=0,
+        train_df=train_partitions[0],
+        val_df=val_partitions[0],
+        preprocessor=shared_prep,
+        dp_config=DPConfig(dp_enabled=True, noise_multiplier=1.0, accountant="rdp"),
+        lr=0.005,
+        weight_decay=0.0,
+    )
+    assert client_dp_valid.default_lr == 0.005
+    assert client_dp_valid.default_weight_decay == 0.0
+    assert client_dp_valid.dp_optimizer.param_groups[0]["weight_decay"] == pytest.approx(0.0)
+
+    # Invalid DP initialization fails before PrivacyEngine attachment
+    with pytest.raises(ValueError, match="lr must be strictly positive and finite"):
+        FLClient(
+            client_id=0,
+            train_df=train_partitions[0],
+            val_df=val_partitions[0],
+            preprocessor=shared_prep,
+            dp_config=DPConfig(dp_enabled=True, noise_multiplier=1.0, accountant="rdp"),
+            lr=-0.01,
+        )
+
+
+def test_flclient_fit_lr_and_weight_decay_pre_mutation_rejection_non_private(partitioned_data):
+    """Verifies invalid lr or weight_decay in fit() config fails before mutating non-DP client state."""
+    train_partitions, val_partitions, shared_prep, _, _, _ = partitioned_data
+    client = FLClient(
+        client_id=1,
+        train_df=train_partitions[1],
+        val_df=val_partitions[1],
+        preprocessor=shared_prep,
+        lr=1e-3,
+        weight_decay=1e-4,
+    )
+    init_params = [p.copy() for p in client.get_parameters(config={})]
+    candidate_params = [p + 5.0 for p in init_params]
+    opt_id = id(client.optimizer)
+
+    # 1. Invalid lr in fit config
+    for bad_lr, exc, match_str in [
+        (True, TypeError, "lr must be a float or int"),
+        ("0.05", TypeError, "lr must be a float or int"),
+        (0.0, ValueError, "lr must be strictly positive and finite"),
+        (-0.01, ValueError, "lr must be strictly positive and finite"),
+        (float("nan"), ValueError, "lr must be strictly positive and finite"),
+        (float("inf"), ValueError, "lr must be strictly positive and finite"),
+    ]:
+        with pytest.raises(exc, match=match_str):
+            client.fit(candidate_params, config={"lr": bad_lr})
+
+        # Client state must be completely unmutated
+        current_params = client.get_parameters(config={})
+        for p_init, p_cur in zip(init_params, current_params):
+            np.testing.assert_allclose(p_cur, p_init, atol=0.0, rtol=0.0)
+        assert client.rounds_executed == 0
+        assert id(client.optimizer) == opt_id
+        assert client.optimizer.param_groups[0]["lr"] == pytest.approx(1e-3)
+
+    # 2. Invalid weight_decay in fit config
+    for bad_wd, exc, match_str in [
+        (False, TypeError, "weight_decay must be a float or int"),
+        ("1e-4", TypeError, "weight_decay must be a float or int"),
+        (-0.001, ValueError, "weight_decay must be non-negative and finite"),
+        (float("nan"), ValueError, "weight_decay must be non-negative and finite"),
+        (float("-inf"), ValueError, "weight_decay must be non-negative and finite"),
+    ]:
+        with pytest.raises(exc, match=match_str):
+            client.fit(candidate_params, config={"weight_decay": bad_wd})
+
+        # Client state must be completely unmutated
+        current_params = client.get_parameters(config={})
+        for p_init, p_cur in zip(init_params, current_params):
+            np.testing.assert_allclose(p_cur, p_init, atol=0.0, rtol=0.0)
+        assert client.rounds_executed == 0
+        assert id(client.optimizer) == opt_id
+        assert client.optimizer.param_groups[0]["weight_decay"] == pytest.approx(1e-4)
+
+    # 3. Valid fit succeeds and updates param_groups in-place
+    fit_params, num_samples, metrics = client.fit(
+        candidate_params,
+        config={"lr": 0.02, "weight_decay": 0.0},
+    )
+    assert client.rounds_executed == 1
+    assert id(client.optimizer) == opt_id
+    assert client.optimizer.param_groups[0]["lr"] == pytest.approx(0.02)
+    assert client.optimizer.param_groups[0]["weight_decay"] == pytest.approx(0.0)
+    assert num_samples == len(train_partitions[1])
+    assert "train_loss" in metrics
+
+
+def test_flclient_fit_lr_and_weight_decay_pre_mutation_rejection_dp(partitioned_data):
+    """Verifies invalid lr or weight_decay in fit() config fails before mutating DP client state or accountant."""
+    train_partitions, val_partitions, shared_prep, _, _, _ = partitioned_data
+    small_train = train_partitions[2].iloc[:20].copy()
+    client = FLClient(
+        client_id=2,
+        train_df=small_train,
+        val_df=val_partitions[2],
+        preprocessor=shared_prep,
+        dp_config=DPConfig(dp_enabled=True, noise_multiplier=1.0, accountant="rdp"),
+        planned_rounds=3,
+        local_epochs=1,
+        lr=1e-3,
+        weight_decay=1e-4,
+    )
+    init_params = [p.copy() for p in client.get_parameters(config={})]
+    candidate_params = [p + 3.0 for p in init_params]
+
+    # 1. Invalid lr in DP fit config
+    for bad_lr, exc, match_str in [
+        (True, TypeError, "lr must be a float or int"),
+        ("0.05", TypeError, "lr must be a float or int"),
+        (0.0, ValueError, "lr must be strictly positive and finite"),
+        (-0.01, ValueError, "lr must be strictly positive and finite"),
+        (float("nan"), ValueError, "lr must be strictly positive and finite"),
+    ]:
+        with pytest.raises(exc, match=match_str):
+            client.fit(candidate_params, config={"lr": bad_lr})
+
+        # Pre-mutation isolation verification
+        current_params = client.get_parameters(config={})
+        for p_init, p_cur in zip(init_params, current_params):
+            np.testing.assert_allclose(p_cur, p_init, atol=0.0, rtol=0.0)
+        assert client.rounds_executed == 0
+        assert client._fit_attempt_counter == 0
+        assert len(client.privacy_engine.accountant.history) == 0
+        assert len(client.blocked_attempts) == 0
+
+    # 2. Invalid weight_decay in DP fit config
+    for bad_wd, exc, match_str in [
+        (False, TypeError, "weight_decay must be a float or int"),
+        ("1e-4", TypeError, "weight_decay must be a float or int"),
+        (-0.001, ValueError, "weight_decay must be non-negative and finite"),
+        (float("nan"), ValueError, "weight_decay must be non-negative and finite"),
+    ]:
+        with pytest.raises(exc, match=match_str):
+            client.fit(candidate_params, config={"weight_decay": bad_wd})
+
+        current_params = client.get_parameters(config={})
+        for p_init, p_cur in zip(init_params, current_params):
+            np.testing.assert_allclose(p_cur, p_init, atol=0.0, rtol=0.0)
+        assert client.rounds_executed == 0
+        assert client._fit_attempt_counter == 0
+        assert len(client.privacy_engine.accountant.history) == 0
+        assert len(client.blocked_attempts) == 0
+
+    # 3. Valid DP fit succeeds
+    fit_params, num_samples, metrics = client.fit(
+        candidate_params,
+        config={"lr": 0.005, "weight_decay": 0.0},
+    )
+    assert client.rounds_executed == 1
+    assert client._fit_attempt_counter == 1
+    assert len(client.privacy_engine.accountant.history) > 0
+    assert client.dp_optimizer.param_groups[0]["lr"] == pytest.approx(0.005)
+    assert client.dp_optimizer.param_groups[0]["weight_decay"] == pytest.approx(0.0)
+    assert metrics["epsilon_realized"] > 0.0
+
+
+def test_flclient_fit_omitted_lr_and_weight_decay_preserves_constructor_defaults(partitioned_data):
+    """Verifies omitting lr and weight_decay in fit config preserves constructor defaults."""
+    train_partitions, val_partitions, shared_prep, _, _, _ = partitioned_data
+    client = FLClient(
+        client_id=3,
+        train_df=train_partitions[3],
+        val_df=val_partitions[3],
+        preprocessor=shared_prep,
+        lr=0.025,
+        weight_decay=3e-4,
+    )
+    init_params = [p.copy() for p in client.get_parameters(config={})]
+
+    client.fit(init_params, config={})
+    assert client.optimizer.param_groups[0]["lr"] == pytest.approx(0.025)
+    assert client.optimizer.param_groups[0]["weight_decay"] == pytest.approx(3e-4)
+
+
+# ==============================================================================
+# Task 2 Fix 3 Stage 2: Client Feature-Dimension Compatibility Tests
+# ==============================================================================
+
+
+def test_client_valid_51_feature_initialization(partitioned_data):
+    """Verifies FLClient constructs with the canonical 51-feature dimensions."""
+    train_partitions, val_partitions, shared_prep, _, _, _ = partitioned_data
+    client = FLClient(
+        client_id=1,
+        train_df=train_partitions[1],
+        val_df=val_partitions[1],
+        model_type="logistic_regression",
+        preprocessor=shared_prep,
+    )
+
+    assert client.model.input_dim == 51
+    # Check train and val DataLoaders contain tensors with width 51
+    batch_X, batch_y = next(iter(client.train_loader))
+    assert batch_X.shape[1] == 51
+    val_batch_X, val_batch_y = next(iter(client.val_loader))
+    assert val_batch_X.shape[1] == 51
+
+
+def test_client_rejection_of_missing_or_unfitted_preprocessing(partitioned_data):
+    """Verifies FLClient rejects missing or unfitted preprocessing when required."""
+    train_partitions, val_partitions, _, _, _, _ = partitioned_data
+
+    # Missing preprocessor (None) rejected by validator
+    with pytest.raises(TypeError, match="preprocessor cannot be None"):
+        validate_client_preprocessor(None)
+
+    # Missing preprocessor rejected when require_preprocessor=True
+    with pytest.raises(TypeError, match="preprocessor cannot be None"):
+        FLClient(
+            client_id=0,
+            train_df=train_partitions[0],
+            val_df=val_partitions[0],
+            preprocessor=None,
+            require_preprocessor=True,
+        )
+
+    # Invalid type
+    with pytest.raises(TypeError, match="must be an instance of TabularPreprocessor"):
+        FLClient(
+            client_id=0,
+            train_df=train_partitions[0],
+            val_df=val_partitions[0],
+            preprocessor="invalid_prep_string",
+        )
+
+    # Unfitted preprocessor
+    unfitted_prep = TabularPreprocessor()
+    with pytest.raises(RuntimeError, match="has not been fit"):
+        FLClient(
+            client_id=0,
+            train_df=train_partitions[0],
+            val_df=val_partitions[0],
+            preprocessor=unfitted_prep,
+        )
+
+
+def test_client_rejection_of_incompatible_feature_names_or_order(partitioned_data):
+    """Verifies FLClient rejects preprocessors with mismatched feature schema or order."""
+    train_partitions, val_partitions, _, _, _, _ = partitioned_data
+
+    # Incompatible feature subset (10 columns instead of 51)
+    incompat_prep = TabularPreprocessor()
+    incompat_prep.medians_ = pd.Series(np.ones(10), index=CANONICAL_FEATURES[:10])
+    incompat_prep.means_ = pd.Series(np.zeros(10), index=CANONICAL_FEATURES[:10])
+    incompat_prep.stds_ = pd.Series(np.ones(10), index=CANONICAL_FEATURES[:10])
+    incompat_prep.feature_cols = CANONICAL_FEATURES[:10]
+
+    with pytest.raises(ValueError, match="expected exactly 51 canonical features"):
+        FLClient(
+            client_id=0,
+            train_df=train_partitions[0],
+            val_df=val_partitions[0],
+            preprocessor=incompat_prep,
+        )
+
+    # Incompatible reordered feature columns
+    reordered_prep = TabularPreprocessor()
+    reordered_prep.medians_ = pd.Series(np.ones(51), index=list(reversed(CANONICAL_FEATURES)))
+    reordered_prep.means_ = pd.Series(np.zeros(51), index=list(reversed(CANONICAL_FEATURES)))
+    reordered_prep.stds_ = pd.Series(np.ones(51), index=list(reversed(CANONICAL_FEATURES)))
+    reordered_prep.feature_cols = list(reversed(CANONICAL_FEATURES))
+
+    with pytest.raises(ValueError, match="exact canonical 51-feature ordering"):
+        FLClient(
+            client_id=0,
+            train_df=train_partitions[0],
+            val_df=val_partitions[0],
+            preprocessor=reordered_prep,
+        )
+
+
+def test_client_rejection_of_incorrect_transformed_matrix_width(partitioned_data, monkeypatch):
+    """Verifies FLClient rejects transformed matrices whose width != 51."""
+    train_partitions, val_partitions, shared_prep, _, _, _ = partitioned_data
+
+    # Mock transform to return a 50-column matrix
+    def mock_bad_transform(self, df):
+        X, y = TabularPreprocessor.transform(self, df)
+        return X[:, :50], y
+
+    monkeypatch.setattr(shared_prep, "transform", mock_bad_transform.__get__(shared_prep, TabularPreprocessor))
+
+    with pytest.raises(ValueError, match="columns; expected exactly 51 canonical features"):
+        FLClient(
+            client_id=0,
+            train_df=train_partitions[0],
+            val_df=val_partitions[0],
+            preprocessor=shared_prep,
+        )
+
+
+def test_client_invalid_configuration_fails_before_training_or_state_mutation(partitioned_data):
+    """Verifies invalid configurations fail before model creation or parameter updates."""
+    train_partitions, val_partitions, shared_prep, _, _, _ = partitioned_data
+
+    # 1. Initialization failure leaves no active client state
+    unfitted_prep = TabularPreprocessor()
+    with pytest.raises(RuntimeError):
+        FLClient(
+            client_id=0,
+            train_df=train_partitions[0],
+            val_df=val_partitions[0],
+            preprocessor=unfitted_prep,
+        )
+
+    # 2. Existing valid client rejects corrupt parameter array without mutating model weights
+    client = FLClient(
+        client_id=2,
+        train_df=train_partitions[2],
+        val_df=val_partitions[2],
+        model_type="logistic_regression",
+        preprocessor=shared_prep,
+    )
+    initial_params = [p.copy() for p in client.get_parameters(config={})]
+
+    # Malformed parameter array of wrong shape
+    corrupt_params = [np.zeros((1, 10), dtype=np.float32), np.zeros((1,), dtype=np.float32)]
+    with pytest.raises(ValueError, match="shape mismatch"):
+        client.fit(corrupt_params, config={})
+
+    # Model parameters must remain unmodified
+    post_params = client.get_parameters(config={})
+    for p_init, p_post in zip(initial_params, post_params):
+        np.testing.assert_allclose(p_init, p_post)
+
+
+# ==============================================================================
+# Task 2 Fix 4 Stage 2: Client Batch-Size and Binary-Label Validation Tests
+# ==============================================================================
+
+
+@pytest.mark.parametrize("valid_bs", [16, 32, np.int64(32), np.int32(16), np.int16(8)])
+def test_client_batch_size_validation_accepts_valid_integers(partitioned_data, valid_bs):
+    """Verifies FLClient accepts positive Python and NumPy integer batch sizes and stores Python int."""
+    train_partitions, val_partitions, shared_prep, _, _, _ = partitioned_data
+    client = FLClient(
+        client_id=0,
+        train_df=train_partitions[0],
+        val_df=val_partitions[0],
+        preprocessor=shared_prep,
+        batch_size=valid_bs,
+    )
+    assert client.batch_size == int(valid_bs)
+    assert type(client.batch_size) is int
+    assert not isinstance(client.batch_size, bool)
+    assert client.train_loader.batch_size == int(valid_bs)
+
+
+@pytest.mark.parametrize(
+    ("bad_bs", "expected_exc"),
+    [
+        (0, ValueError),
+        (-1, ValueError),
+        (-32, ValueError),
+        (True, TypeError),
+        (False, TypeError),
+        (np.bool_(True), TypeError),
+        (32.0, TypeError),
+        (16.5, TypeError),
+        ("32", TypeError),
+        (None, TypeError),
+        ([32], TypeError),
+    ],
+)
+def test_client_batch_size_validation_rejects_invalid_types_and_values(
+    partitioned_data, bad_bs, expected_exc
+):
+    """Verifies FLClient rejects non-integers, booleans, zero, and negative batch sizes fail-fast."""
+    train_partitions, val_partitions, shared_prep, _, _, _ = partitioned_data
+    with pytest.raises(expected_exc):
+        FLClient(
+            client_id=0,
+            train_df=train_partitions[0],
+            val_df=val_partitions[0],
+            preprocessor=shared_prep,
+            batch_size=bad_bs,
+        )
+
+
+def test_client_rejects_invalid_training_labels(partitioned_data):
+    """Verifies FLClient rejects partitions with non-binary training labels before model creation."""
+    train_partitions, val_partitions, shared_prep, _, _, _ = partitioned_data
+
+    # Corrupt training partition with value 2.0
+    bad_train_df = train_partitions[0].copy()
+    bad_train_df.loc[bad_train_df.index[0], "in_hospital_mortality"] = 2.0
+
+    with pytest.raises(ValueError, match=r"only binary values in \{0, 1\}"):
+        FLClient(
+            client_id=0,
+            train_df=bad_train_df,
+            val_df=val_partitions[0],
+            preprocessor=shared_prep,
+        )
+
+    # Corrupt training partition with NaN
+    bad_train_nan = train_partitions[0].copy()
+    bad_train_nan["in_hospital_mortality"] = bad_train_nan["in_hospital_mortality"].astype(float)
+    bad_train_nan.loc[bad_train_nan.index[0], "in_hospital_mortality"] = np.nan
+
+    with pytest.raises(ValueError, match="non-finite values"):
+        FLClient(
+            client_id=0,
+            train_df=bad_train_nan,
+            val_df=val_partitions[0],
+            preprocessor=shared_prep,
+        )
+
+
+def test_client_rejects_invalid_validation_labels(partitioned_data):
+    """Verifies FLClient rejects partitions with non-binary validation labels before model creation."""
+    train_partitions, val_partitions, shared_prep, _, _, _ = partitioned_data
+
+    # Corrupt validation partition with value 0.5
+    bad_val_df = val_partitions[0].copy()
+    bad_val_df["in_hospital_mortality"] = bad_val_df["in_hospital_mortality"].astype(float)
+    bad_val_df.loc[bad_val_df.index[0], "in_hospital_mortality"] = 0.5
+
+    with pytest.raises(ValueError, match=r"only binary values in \{0, 1\}"):
+        FLClient(
+            client_id=0,
+            train_df=train_partitions[0],
+            val_df=bad_val_df,
+            preprocessor=shared_prep,
+        )
+
+
+def test_client_dp_sampling_rate_and_planned_steps_consistency(partitioned_data):
+    """Verifies DP client effective sample rate and planned steps align strictly with batch size."""
+    train_partitions, val_partitions, shared_prep, _, _, _ = partitioned_data
+
+    dp_cfg = DPConfig(dp_enabled=True, epsilon_target=3.0, accountant="rdp")
+    client = FLClient(
+        client_id=0,
+        train_df=train_partitions[0],
+        val_df=val_partitions[0],
+        preprocessor=shared_prep,
+        dp_config=dp_cfg,
+        batch_size=16,
+        planned_rounds=2,
+        local_epochs=2,
+    )
+
+    num_batches = len(client.train_loader)
+    expected_sample_rate = 1.0 / float(num_batches)
+    expected_planned_steps = 2 * 2 * num_batches
+
+    assert client.dp_attachment is not None
+    assert client.dp_attachment.sample_rate == pytest.approx(expected_sample_rate)
+    assert client.planned_steps == expected_planned_steps
+
+    # Execute 1 fit round and verify recorded steps in accountant history
+    init_params = [p.copy() for p in client.get_parameters(config={})]
+    client.fit(init_params, config={"local_epochs": 2})
+
+    accountant_history = client.privacy_engine.accountant.history
+    steps_recorded = sum(steps for _, _, steps in accountant_history)
+    assert steps_recorded == 2 * num_batches
+
+
+def test_client_dp_batch_size_larger_than_dataset_prv_vs_rdp(partitioned_data):
+    """Verifies batch_size >= dataset_size raises ValueError for PRV while RDP succeeds."""
+    train_partitions, val_partitions, shared_prep, _, _, _ = partitioned_data
+    n_train = len(train_partitions[0])
+    large_bs = n_train + 10  # batch_size exceeds dataset size => 1 batch => q=1.0
+
+    # PRV must reject sample_rate = 1.0
+    prv_cfg = DPConfig(dp_enabled=True, epsilon_target=3.0, accountant="prv")
+    with pytest.raises(ValueError, match="accountant='prv' cannot be used with sample_rate=1.0"):
+        FLClient(
+            client_id=0,
+            train_df=train_partitions[0],
+            val_df=val_partitions[0],
+            preprocessor=shared_prep,
+            dp_config=prv_cfg,
+            batch_size=large_bs,
+        )
+
+    # RDP allows sample_rate = 1.0
+    rdp_cfg = DPConfig(dp_enabled=True, epsilon_target=3.0, accountant="rdp")
+    client_rdp = FLClient(
+        client_id=0,
+        train_df=train_partitions[0],
+        val_df=val_partitions[0],
+        preprocessor=shared_prep,
+        dp_config=rdp_cfg,
+        batch_size=large_bs,
+    )
+    assert client_rdp.dp_attachment is not None
+    assert client_rdp.dp_attachment.sample_rate == pytest.approx(1.0)
